@@ -1,0 +1,5 @@
+fastapi
+uvicorn[standard]
+pydantic
+pyodbc
+# databricks-sql-connector  # optional: uncomment if using Databricks
