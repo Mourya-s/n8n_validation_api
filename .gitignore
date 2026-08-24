@@ -1,0 +1,24 @@
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Generated reports
+comparison-service/report.csv
+comparison-service/report.xlsx
+comparison-service/*.csv
+comparison-service/*.xlsx
+~$*.xlsx
+~$*.xls
+
+# Editor / OS
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
