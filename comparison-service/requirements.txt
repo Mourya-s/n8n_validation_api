@@ -2,4 +2,17 @@ fastapi
 uvicorn[standard]
 pydantic
 pyodbc
-# databricks-sql-connector  # optional: uncomment if using Databricks
+
+# Databricks SQL Warehouse connectivity - required by databricks_connector.py
+# (was commented out, but the module already does `from databricks import sql`)
+databricks-sql-connector
+
+# Used by comparison_engine.py (already imported, was missing here)
+pandas
+numpy
+
+# Used by report_generator.py for the Excel validation report
+openpyxl
+
+# Testing
+pytest

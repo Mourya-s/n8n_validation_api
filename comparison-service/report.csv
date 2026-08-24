@@ -1,0 +1,2 @@
+﻿Source Schema,Source Table,Target Schema,Target Table,Overall Status,Schema Match,Column Order,Row Count (Src),Row Count (Tgt),Row Count Diff,Data Types,Nullable,Null Counts,Distinct Counts,Min/Max,Data Match,Mismatch Count,Mismatch %,Row Hash Mismatch Count,Row Hash Mismatch %,Validation Timestamp,Duration
+for_schema_validation,sample_30_mb,for_schema_validation,sample_30_mb,FAIL,PASS,PASS,379773,379773,0,FAIL,PASS,PASS,FAIL,FAIL,SKIPPED,,,0,0.00%,2026-08-24T10:32:28.208553+00:00,11.533
