@@ -1113,40 +1113,76 @@ class CatalogValidator:
             table_name
         )
 
-        if row_hash_key_columns:
-            try:
+        logger.info(
+            "[row-hash] table=%s.%s | configured_keys=%s | lookup='%s' or '%s' | resolved_key_columns=%s",
+            schema_name, table_name, list(request.primary_keys.keys()),
+            key_lookup, table_name, row_hash_key_columns,
+        )
+
+        using_row_number_fallback = not row_hash_key_columns
+        if using_row_number_fallback:
+            logger.info(
+                "[row-hash] no key configured for '%s.%s' - falling back to "
+                "ROW_NUMBER()-based comparison (ORDER BY every common column). "
+                "Best-effort only: reliable solely when both sides have the same "
+                "row set.",
+                schema_name, table_name,
+            )
+
+        try:
+            if using_row_number_fallback:
+                mismatches, mismatch_count, mismatch_pct = self._run_row_hash_stage_by_row_number(
+                    request, schema_name, table_name, common_cols,
+                )
+                effective_key_columns = ["row_number"]
+            else:
                 mismatches, mismatch_count, mismatch_pct = self._run_row_hash_stage(
                     request, schema_name, table_name, common_cols, row_hash_key_columns,
                 )
-                if result.data is None:
-                    result.data = DataValidationResult(
-                        mode=request.data_compare_mode,
-                        status=ValidationStatus.SKIPPED,
-                        note="Row-level EXCEPT/hash-join comparison not run for this mode.",
-                    )
-                result.data.row_hash_mismatches = mismatches
-                result.data.row_hash_mismatch_count = mismatch_count
-                result.data.row_hash_mismatch_percentage = mismatch_pct
-                if mismatch_count > 0 and result.data.status != ValidationStatus.ERROR:
-                    result.data.status = ValidationStatus.FAIL
-                elif result.data.status == ValidationStatus.SKIPPED and mismatch_count == 0:
-                    # Row hashes matched perfectly - that's a real PASS signal,
-                    # not "nothing was checked".
-                    result.data.status = ValidationStatus.PASS
-            except Exception as exc:
-                logger.exception(
-                    "Failed to run row-hash comparison for '%s.%s'", schema_name, table_name
+                effective_key_columns = row_hash_key_columns
+
+            logger.info(
+                "[row-hash] table=%s.%s | key_columns=%s | mismatch_count=%s | mismatch_pct=%.2f%%",
+                schema_name, table_name, effective_key_columns, mismatch_count, mismatch_pct,
+            )
+            if result.data is None:
+                result.data = DataValidationResult(
+                    mode=request.data_compare_mode,
+                    status=ValidationStatus.SKIPPED,
+                    note="Row-level EXCEPT/hash-join comparison not run for this mode.",
                 )
-                if result.data is None:
-                    result.data = DataValidationResult(
-                        mode=request.data_compare_mode,
-                        status=ValidationStatus.ERROR,
-                        key_columns=row_hash_key_columns,
-                        error=f"Row-hash comparison failed: {exc}",
-                    )
-                else:
-                    result.data.status = ValidationStatus.ERROR
-                    result.data.error = f"Row-hash comparison failed: {exc}"
+            result.data.row_hash_mismatches = mismatches
+            result.data.row_hash_mismatch_count = mismatch_count
+            result.data.row_hash_mismatch_percentage = mismatch_pct
+            result.data.key_columns = effective_key_columns
+            if using_row_number_fallback:
+                result.data.note = (
+                    "No primary key configured - row-level comparison used a "
+                    "synthetic ROW_NUMBER() (ORDER BY every common column) "
+                    "instead of a real key. Only reliable when both sides "
+                    "contain the same set of rows; cannot pinpoint which "
+                    "specific record changed the way a real key can."
+                )
+            if mismatch_count > 0 and result.data.status != ValidationStatus.ERROR:
+                result.data.status = ValidationStatus.FAIL
+            elif result.data.status == ValidationStatus.SKIPPED and mismatch_count == 0:
+                # Row hashes matched perfectly - that's a real PASS signal,
+                # not "nothing was checked".
+                result.data.status = ValidationStatus.PASS
+        except Exception as exc:
+            logger.exception(
+                "Failed to run row-hash comparison for '%s.%s'", schema_name, table_name
+            )
+            if result.data is None:
+                result.data = DataValidationResult(
+                    mode=request.data_compare_mode,
+                    status=ValidationStatus.ERROR,
+                    key_columns=row_hash_key_columns or ["row_number"],
+                    error=f"Row-hash comparison failed: {exc}",
+                )
+            else:
+                result.data.status = ValidationStatus.ERROR
+                result.data.error = f"Row-hash comparison failed: {exc}"
 
         # Stage 16: overall table status
         result.status = self.calculate_overall_status(
@@ -1264,6 +1300,11 @@ class CatalogValidator:
             table_name
         )
 
+        logger.info(
+            "[compare_data] table=%s.%s | mode=%s | resolved_key_columns=%s",
+            schema_name, table_name, mode.value, key_columns,
+        )
+
         if mode == DataCompareMode.COUNT_ONLY:
             return DataValidationResult(
                 mode=mode,
@@ -1336,6 +1377,14 @@ class CatalogValidator:
             or diff["changed_rows"] > 0
         )
 
+        logger.info(
+            "[data-mismatch] table=%s.%s | mode=%s | source_only=%d | target_only=%d | "
+            "changed_rows=%d | sample_changed_detail_rows=%d",
+            schema_name, table_name, mode.value,
+            diff["source_only_rows"], diff["target_only_rows"], diff["changed_rows"],
+            len(diff.get("sample_changed_detail", [])),
+        )
+
         sample_changed_detail: List[RowMismatchDetail] = []
         if mode == DataCompareMode.FULL:
             for row in diff.get("sample_changed_detail", []):
@@ -1395,6 +1444,11 @@ class CatalogValidator:
             c for c in common_columns if c.lower() not in {k.lower() for k in key_columns}
         )
 
+        logger.info(
+            "[row-hash] fetching hashes | table=%s.%s | key_columns=%s | value_columns=%s",
+            schema_name, table_name, key_columns, value_columns,
+        )
+
         source_hashes = self.databricks.get_row_hashes(
             request.source_catalog, schema_name, table_name, value_columns, key_columns,
         )
@@ -1402,7 +1456,47 @@ class CatalogValidator:
             request.target_catalog, schema_name, table_name, value_columns, key_columns,
         )
 
+        logger.info(
+            "[row-hash] fetched | table=%s.%s | source_rows=%d | target_rows=%d",
+            schema_name, table_name, len(source_hashes), len(target_hashes),
+        )
+
         return self.compare_row_hashes(source_hashes, target_hashes, key_columns)
+
+    def _run_row_hash_stage_by_row_number(
+        self,
+        request: CatalogValidationRequest,
+        schema_name: str,
+        table_name: str,
+        common_columns: List[str],
+    ) -> Tuple[List[RowHashMismatch], int, float]:
+        """
+        Fallback used when no primary key is configured for the table:
+        both sides get a synthetic ROW_NUMBER() (ORDER BY every common
+        column) instead of a real key. See
+        DatabricksConnector.get_row_hashes_by_row_number for the caveat
+        about what this can and cannot detect.
+        """
+        value_columns = sorted(common_columns)
+
+        logger.info(
+            "[row-hash] fetching row-number hashes | table=%s.%s | value_columns=%s",
+            schema_name, table_name, value_columns,
+        )
+
+        source_hashes = self.databricks.get_row_hashes_by_row_number(
+            request.source_catalog, schema_name, table_name, value_columns,
+        )
+        target_hashes = self.databricks.get_row_hashes_by_row_number(
+            request.target_catalog, schema_name, table_name, value_columns,
+        )
+
+        logger.info(
+            "[row-hash] fetched row-number hashes | table=%s.%s | source_rows=%d | target_rows=%d",
+            schema_name, table_name, len(source_hashes), len(target_hashes),
+        )
+
+        return self.compare_row_hashes(source_hashes, target_hashes, ["row_number"])
 
     @staticmethod
     def compare_row_hashes(

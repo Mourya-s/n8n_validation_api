@@ -53,6 +53,9 @@ def _make_connector(**overrides) -> MagicMock:
         "name": {"null_count": 2, "distinct_count": 95, "min": None, "max": None},
     }
     mock.is_min_max_eligible.side_effect = lambda dt: dt.lower().startswith("int")
+    mock.get_row_hashes_by_row_number.side_effect = lambda catalog, schema, table, cols: (
+        _hash_df([(1, "aaa"), (2, "bbb")], key="row_number")
+    )
     for key, value in overrides.items():
         setattr(mock, key, value)
     return mock
@@ -454,7 +457,7 @@ def test_calculate_overall_status(statuses, expected):
 # ---------------------------------------------------------------------------
 # Data compare mode: default STATISTICS mode skips row-level compare
 # ---------------------------------------------------------------------------
-def test_default_mode_skips_row_level_data_comparison():
+def test_default_mode_skips_key_based_row_diff_but_row_hash_fallback_still_runs():
     connector = _make_connector()
     validator = CatalogValidator(connector)
 
@@ -462,11 +465,15 @@ def test_default_mode_skips_row_level_data_comparison():
     table = result.schemas[0].tables[0]
 
     assert table.data.mode == DataCompareMode.STATISTICS
-    assert table.data.status == ValidationStatus.SKIPPED
     connector.key_based_row_diff.assert_not_called()
+    # No primary key configured -> the row-hash stage falls back to a
+    # ROW_NUMBER()-based comparison rather than skipping entirely.
+    connector.get_row_hashes_by_row_number.assert_called()
+    assert table.data.key_columns == ["row_number"]
+    assert "row_number" in table.data.note.lower() if table.data.note else True
 
 
-def test_full_mode_without_key_is_skipped_safely():
+def test_full_mode_without_key_uses_row_number_fallback():
     connector = _make_connector()
     validator = CatalogValidator(connector)
 
@@ -475,8 +482,9 @@ def test_full_mode_without_key_is_skipped_safely():
     )
     table = result.schemas[0].tables[0]
 
-    assert table.data.status == ValidationStatus.SKIPPED
-    assert "key" in table.data.note.lower()
+    assert table.data.key_columns == ["row_number"]
+    assert table.data.note is not None
+    assert "row_number" in table.data.note.lower() or "row-number" in table.data.note.lower()
 
 
 # ---------------------------------------------------------------------------
@@ -486,9 +494,9 @@ def test_full_mode_without_key_is_skipped_safely():
 # row-level mismatches whenever a primary key is configured, independent
 # of data_compare_mode.
 # ---------------------------------------------------------------------------
-def _hash_df(rows):
-    """rows: list of (id, row_hash)"""
-    return pd.DataFrame([{"id": r[0], "row_hash": r[1]} for r in rows])
+def _hash_df(rows, key="id"):
+    """rows: list of (key_value, row_hash)"""
+    return pd.DataFrame([{key: r[0], "row_hash": r[1]} for r in rows])
 
 
 def test_row_hashes_matching_produces_no_mismatch():
@@ -579,16 +587,18 @@ def test_row_hashes_key_missing_from_source():
     assert table.data.status == ValidationStatus.FAIL
 
 
-def test_row_hashes_skipped_when_no_primary_key_configured():
+def test_row_hashes_use_row_number_fallback_when_no_primary_key_configured():
     connector = _make_connector()
     validator = CatalogValidator(connector)
 
     result = validator.compare_catalogs(_request())
     table = result.schemas[0].tables[0]
 
+    # No real key configured -> get_row_hashes (real-key path) is never
+    # called; get_row_hashes_by_row_number (fallback) is used instead.
+    connector.get_row_hashes.assert_not_called()
+    connector.get_row_hashes_by_row_number.assert_called()
     assert table.data.row_hash_mismatches == []
     assert table.data.row_hash_mismatch_count == 0
-    connector.get_row_hashes.assert_not_called()
-    # No key configured -> compare_data's own STATISTICS-mode skip is
-    # untouched by the row-hash stage.
-    assert table.data.status == ValidationStatus.SKIPPED
+    # Matching row-number hashes on both sides is a real PASS signal.
+    assert table.data.status == ValidationStatus.PASS

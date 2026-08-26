@@ -11,8 +11,15 @@ databricks-sql-connector
 pandas
 numpy
 
-# Used by report_generator.py for the Excel validation report
+# Azure Blob Storage connectivity - required by azure_connector.py
+azure-storage-blob
+
+# Used by report_generator.py for the Excel validation report, and by
+# azure_connector.py for reading Excel-format blobs
 openpyxl
+
+# Used by azure_connector.py for reading Parquet-format blobs
+pyarrow
 
 # Testing
 pytest

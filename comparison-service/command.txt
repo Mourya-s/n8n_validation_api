@@ -1,0 +1,19 @@
+>for one file :--
+
+python app.py validate-catalogs --source-catalog for_validation1 --target-catalog for_validation2 --mode FULL --primary-keys "for_schema_validation.book_2=id" --csv report.csv --excel report.xlsx
+
+
+>for two files :-
+
+python app.py validate-catalogs --source-catalog for_validation1 --target-catalog for_validation2 --mode FULL --primary-keys "for_schema_validation.sample_30_mb=id;for_schema_validation.file_example_xlsx_100=0" --csv report.csv --excel report.xlsx
+
+
+
+---------------------
+>+claude generated command
+python app.py validate-csv --source-blob "n8ndirectory/file_example_XLSX_100.csv" --target-catalog for_validation2 --target-schema for_schema_validation --target-table file_example_xlsx_100 --primary-key 0 --mode FULL --csv report.csv --excel report.xlsx
+
+
+
+----
+azure sql datbase as sourcepython app.py validate-sql --target-catalog for_validation1 --schema-map "dbo=for_schema_validation" --mode FULL --primary-keys "for_schema_validation.employees_sample=EmployeeID" --csv report.csv --excel report.xlsx

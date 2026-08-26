@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import datetime
 import logging
+import numbers
 import os
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -21,6 +22,52 @@ from databricks import sql
 from databricks.sql.client import Connection
 
 logger = logging.getLogger(__name__)
+
+# numbers.Number covers int/float/Decimal AND numpy's numeric scalar types
+# (np.int64, np.float64, ...) in one check - values returned by pandas/
+# numpy-backed connectors (Databricks) need to compare cleanly against
+# plain Decimal/int values from a DB-API driver (e.g. pyodbc), and
+# Decimal.__eq__ raises TypeError rather than returning False when handed
+# a numpy scalar it doesn't recognize.
+_NUMERIC_TYPES = numbers.Number
+
+
+def values_differ(a: Any, b: Any) -> bool:
+    """
+    Robust value comparison for two independently-fetched cells (e.g. one
+    row read from a source and one from a target, via separate round-trips
+    - a SQL query pair, or a CSV row vs a SQL row).
+
+    Raw `!=` is too strict here: two sides can return numerically-equal
+    values with different Python representations for the SAME underlying
+    type family (e.g. Decimal vs float precision, or date vs datetime),
+    which would otherwise register as a false mismatch against a row
+    already flagged as changed by a whole-row hash comparison.
+
+    Deliberately NOT applied across a numeric-vs-string type change (e.g.
+    a column migrated from double to string) - that IS a real, reportable
+    difference even if the string happens to parse to the same number.
+    """
+    if a is None or b is None:
+        return a is not b
+
+    if isinstance(a, _NUMERIC_TYPES) and isinstance(b, _NUMERIC_TYPES):
+        return abs(float(a) - float(b)) > 1e-9
+
+    if isinstance(a, (datetime.date, datetime.datetime)) and isinstance(
+        b, (datetime.date, datetime.datetime)
+    ):
+        a_cmp = a.date() if isinstance(a, datetime.datetime) else a
+        b_cmp = b.date() if isinstance(b, datetime.datetime) else b
+        return a_cmp != b_cmp
+
+    # A type change between the two sides (e.g. one side returned a number,
+    # the other a string) is itself a real difference, even if their
+    # string forms happen to look identical.
+    if type(a) is not type(b):
+        return True
+
+    return str(a) != str(b)
 
 
 # Data types for which MIN/MAX is meaningful. Kept as a prefix match against
@@ -689,34 +736,6 @@ class DatabricksConnector:
         def _key_tuple(row: Dict[str, Any]) -> tuple:
             return tuple(row.get(k) for k in key_columns)
 
-        def _values_differ(a: Any, b: Any) -> bool:
-            """
-            Robust value comparison for two independently-fetched cells.
-            Raw `!=` is too strict here: source/target come from separate
-            query round-trips and Databricks can return numerically-equal
-            values with different Python representations (e.g. Decimal vs
-            float precision, or date vs datetime), which would otherwise
-            register as a false mismatch/false match mismatch against the
-            row already flagged as changed by the SQL-side hash().
-            """
-            if a is None or b is None:
-                return a is not b
-
-            if isinstance(a, (int, float)) or isinstance(b, (int, float)):
-                try:
-                    return abs(float(a) - float(b)) > 1e-9
-                except (TypeError, ValueError):
-                    pass
-
-            if isinstance(a, (datetime.date, datetime.datetime)) or isinstance(
-                b, (datetime.date, datetime.datetime)
-            ):
-                a_cmp = a.date() if isinstance(a, datetime.datetime) else a
-                b_cmp = b.date() if isinstance(b, datetime.datetime) else b
-                return a_cmp != b_cmp
-
-            return str(a) != str(b)
-
         target_by_key = {_key_tuple(r): r for r in target_rows}
 
         detail: List[Dict[str, Any]] = []
@@ -727,7 +746,7 @@ class DatabricksConnector:
 
             mismatched_columns = [
                 col for col in value_columns
-                if _values_differ(src_row.get(col), tgt_row.get(col))
+                if values_differ(src_row.get(col), tgt_row.get(col))
             ]
             if not mismatched_columns:
                 # SQL-side hash() flagged this row as changed, but our
@@ -809,6 +828,62 @@ class DatabricksConnector:
 
         if df.empty:
             return pd.DataFrame(columns=list(primary_key_cols) + ["row_hash"])
+
+        return df
+
+    def get_row_hashes_by_row_number(
+        self,
+        catalog: str,
+        schema: str,
+        table: str,
+        columns: Sequence[str],
+    ) -> pd.DataFrame:
+        """
+        Fallback for tables with no configured primary key: assigns a
+        synthetic row number via ROW_NUMBER() OVER (ORDER BY <every
+        requested column>) on both sides, then hashes each row the same
+        way get_row_hashes does. Ordering by every column (not insertion
+        order, which SQL never guarantees) means two logically-identical
+        rows always sort next to each other and get matching numbers
+        regardless of physical storage order - but this is NOT a
+        substitute for a real key: if the two sides don't contain the
+        same *set* of rows, row N on one side is not necessarily the same
+        logical record as row N on the other, and comparisons will be
+        misleading. Only use when no real shared key exists.
+
+        Returns a DataFrame with columns: row_number, row_hash.
+        """
+        null_sentinel = "\x01NULL\x01"
+        hashed_exprs = [
+            f"COALESCE(CAST({self._quote_ident(c)} AS STRING), '{null_sentinel}')"
+            for c in columns
+        ]
+
+        if not hashed_exprs:
+            raise ValueError("columns must be non-empty for row-number based hashing")
+
+        order_by = ", ".join(self._quote_ident(c) for c in columns)
+        row_hash_expr = f"sha2(concat_ws('||', {', '.join(hashed_exprs)}), 256)"
+
+        query = f"""
+            SELECT
+                ROW_NUMBER() OVER (ORDER BY {order_by}) AS row_number,
+                {row_hash_expr} AS row_hash
+            FROM {self._qualify(catalog, schema, table)}
+        """
+
+        try:
+            df = self._execute_to_dataframe(query)
+        except Exception as exc:
+            logger.exception(
+                "Failed to compute row-number-based hashes for '%s.%s.%s'", catalog, schema, table
+            )
+            raise RuntimeError(
+                f"Unable to compute row-number-based hashes for '{catalog}.{schema}.{table}': {exc}"
+            ) from exc
+
+        if df.empty:
+            return pd.DataFrame(columns=["row_number", "row_hash"])
 
         return df
 

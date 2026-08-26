@@ -435,6 +435,130 @@ class CatalogValidationRequest(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Azure Blob CSV -> single Databricks table validation request
+#
+# Reuses the exact same result shape (CatalogValidationResponse, wrapping
+# one SchemaValidationResult with one TableValidationResult) as the
+# catalog-to-catalog path above, so report_generator.py needs no changes -
+# it just sees "one schema, one table" instead of many.
+# ---------------------------------------------------------------------------
+class CsvTableValidationRequest(BaseModel):
+
+    source_blob_path: str = Field(
+        ..., min_length=1,
+        description="Path to the source CSV inside the Azure Storage container, e.g. 'validation/customers.csv'.",
+    )
+
+    target_catalog: str = Field(..., min_length=1)
+    target_schema: str = Field(..., min_length=1)
+    target_table: str = Field(..., min_length=1)
+
+    primary_key: List[str] = Field(
+        default_factory=list,
+        description=(
+            "Primary/business key column(s), used for row-hash and row-level "
+            "data comparison. If omitted, comparison falls back to a "
+            "synthetic row-number match (CSV file order vs. a Databricks "
+            "ROW_NUMBER() over the same column order) - best-effort only, "
+            "not a substitute for a real key."
+        ),
+    )
+
+    ignore_columns: List[str] = Field(default_factory=list)
+
+    case_sensitive_columns: bool = Field(default=False)
+    validate_column_order: bool = Field(default=True)
+
+    data_compare_mode: DataCompareMode = Field(
+        default_factory=DataCompareMode.default
+    )
+
+    max_sample_rows: int = Field(default=50, ge=1, le=1000)
+
+    @field_validator("primary_key", "ignore_columns", mode="before")
+    @classmethod
+    def _ensure_list(cls, value: Any) -> Any:
+        if value is None:
+            return value
+        if isinstance(value, str):
+            return [value]
+        return list(value)
+
+    model_config = {"extra": "forbid"}
+
+
+# ---------------------------------------------------------------------------
+# Azure SQL Database -> Databricks catalog validation request
+#
+# Multi-table, matched by name: every table in the Azure SQL database
+# (optionally restricted to `schemas`/`tables`) is matched against a
+# like-named table in the target Databricks catalog/schema, mirroring
+# CatalogValidationRequest's schema/table matching. Returns the same
+# CatalogValidationResponse shape as CatalogValidator, so
+# report_generator.py needs no changes.
+# ---------------------------------------------------------------------------
+class AzureSqlValidationRequest(BaseModel):
+
+    target_catalog: str = Field(..., min_length=1)
+
+    schemas: Optional[List[str]] = Field(
+        default=None,
+        description=(
+            "Restrict validation to these Azure SQL schemas (matched to "
+            "same-named Databricks schemas, or remapped via schema_map). "
+            "If omitted, all schemas common to both sides are validated."
+        ),
+    )
+
+    schema_map: Dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "Optional map of Azure SQL schema name -> Databricks schema "
+            "name, for when the two sides use different schema names for "
+            "the same logical migration target (e.g. Azure SQL's default "
+            "'dbo' vs a purpose-named Databricks schema). Unmapped "
+            "schemas are matched by identical name as usual."
+        ),
+    )
+
+    tables: Optional[List[str]] = Field(
+        default=None,
+        description="Restrict validation to these table names. If omitted, all common tables are validated.",
+    )
+
+    ignore_columns: List[str] = Field(default_factory=list)
+
+    case_sensitive_columns: bool = Field(default=False)
+    validate_column_order: bool = Field(default=True)
+
+    primary_keys: Dict[str, List[str]] = Field(
+        default_factory=dict,
+        description=(
+            "Map of 'schema.table' -> key column list, used for row-hash "
+            "and row-level data comparison. Tables without an entry get "
+            "schema/row-count/statistics validation only."
+        ),
+    )
+
+    data_compare_mode: DataCompareMode = Field(
+        default_factory=DataCompareMode.default
+    )
+
+    max_sample_rows: int = Field(default=50, ge=1, le=1000)
+
+    @field_validator("schemas", "tables", "ignore_columns", mode="before")
+    @classmethod
+    def _ensure_list(cls, value: Any) -> Any:
+        if value is None:
+            return value
+        if isinstance(value, str):
+            return [value]
+        return list(value)
+
+    model_config = {"extra": "forbid"}
+
+
+# ---------------------------------------------------------------------------
 # Result building blocks
 # ---------------------------------------------------------------------------
 class ColumnValidationResult(BaseModel):

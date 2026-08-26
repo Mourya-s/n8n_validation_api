@@ -81,6 +81,10 @@ ROW_HASH_HEADERS = [
 ]
 _ROW_HASH_STATUS_COLUMN = 7
 
+SUGGESTION_HEADERS = [
+    "Source Schema", "Source Table", "Column", "Issue Type", "Suggestion",
+]
+
 SUMMARY_METRIC_LABELS = [
     "Total Tables", "Passed Tables", "Failed Tables",
     "Error Tables", "Skipped Tables", "Pass Percentage",
@@ -234,12 +238,12 @@ def _build_column_rows(result: CatalogValidationResponse) -> List[List[Any]]:
             for missing_col in table.missing_columns:
                 rows.append(
                     [schema.schema_name, table.table, missing_col, "MISSING_FROM_TARGET"]
-                    + [""] * 17
+                    + [""] * 18
                 )
             for extra_col in table.extra_columns:
                 rows.append(
                     [schema.schema_name, table.table, extra_col, "EXTRA_IN_TARGET"]
-                    + [""] * 17
+                    + [""] * 18
                 )
 
     rows.sort(key=lambda r: (r[0], r[1], r[2]))
@@ -296,6 +300,175 @@ def _build_row_hash_rows(result: CatalogValidationResponse) -> List[List[Any]]:
     # Prepend a 1-based sequential row number, assigned after sorting so it
     # reflects final display order (not discovery order).
     return [[i, *row] for i, row in enumerate(rows, start=1)]
+
+
+def _build_suggestion_rows(result: CatalogValidationResponse) -> List[List[Any]]:
+    """
+    One plain-English sentence per issue found on a table, covering every
+    category that can independently fail a table's Overall Status:
+    schema/constraint issues (missing/extra column, column order, data
+    type, nullable), per-column statistics (null count, distinct count,
+    min/max), row count, and row-level data (pointing at the Data
+    Mismatches / Row Hash Mismatches sheets for full detail rather than
+    duplicating it here).
+
+    If a table's row data actually matches (row count, row-hash/data
+    comparison all passed) but the table still failed purely on
+    schema/constraint or statistics grounds, an extra summary sentence
+    calls that out explicitly, since it's an easy thing to miss buried in
+    status columns. Every FAILed table gets at least one row here - if
+    none of the specific categories below apply, a fallback sentence
+    still points at Table Validation for the table's own Error field.
+    """
+    rows: List[List[Any]] = []
+
+    for schema in result.schemas:
+        for table in schema.tables:
+            if table.status not in (ValidationStatus.FAIL, ValidationStatus.ERROR):
+                continue
+
+            table_issues: List[List[Any]] = []
+
+            for col in table.missing_columns:
+                table_issues.append([
+                    schema.schema_name, table.table, col, "Missing Column",
+                    f"Column '{col}' exists in the source but not in the target - "
+                    f"it may not have been migrated, or was renamed/dropped.",
+                ])
+
+            for col in table.extra_columns:
+                table_issues.append([
+                    schema.schema_name, table.table, col, "Extra Column",
+                    f"Column '{col}' exists in the target but not in the source - "
+                    f"check whether it was added intentionally or is leftover from a prior load.",
+                ])
+
+            if table.column_order_status == ValidationStatus.FAIL:
+                table_issues.append([
+                    schema.schema_name, table.table, "-", "Column Order",
+                    f"Columns match by name but are in a different order between source "
+                    f"({', '.join(table.source_column_order)}) and target "
+                    f"({', '.join(table.target_column_order)}).",
+                ])
+
+            if table.row_count_status == ValidationStatus.FAIL:
+                diff = table.row_count_difference
+                direction = "more" if (diff or 0) > 0 else "fewer"
+                table_issues.append([
+                    schema.schema_name, table.table, "-", "Row Count Mismatch",
+                    f"Target has {abs(diff) if diff is not None else 'a different number of'} "
+                    f"{direction} rows than source ({table.row_count_source} vs "
+                    f"{table.row_count_target}) - check for a partial load, duplicate rows, "
+                    f"or rows deleted/inserted after migration.",
+                ])
+            elif table.row_count_status == ValidationStatus.ERROR:
+                table_issues.append([
+                    schema.schema_name, table.table, "-", "Row Count Error",
+                    f"Row count could not be verified for this table"
+                    + (f": {table.error}" if table.error else " - see the Error column in Table Validation.")
+                ])
+
+            for col in table.columns:
+                if col.data_type_status == ValidationStatus.FAIL:
+                    table_issues.append([
+                        schema.schema_name, table.table, col.column, "Data Type Mismatch",
+                        f"Column '{col.column}' is {col.source_data_type} in the source but "
+                        f"{col.target_data_type} in the target - if the row data still matches, "
+                        f"only the declared type differs; if not, check for precision/format loss "
+                        f"during migration.",
+                    ])
+
+                if col.nullable_status == ValidationStatus.FAIL:
+                    src_null = "nullable" if col.source_nullable else "NOT NULL"
+                    tgt_null = "nullable" if col.target_nullable else "NOT NULL"
+                    table_issues.append([
+                        schema.schema_name, table.table, col.column, "Nullable Mismatch",
+                        f"Column '{col.column}' is declared {src_null} in the source but "
+                        f"{tgt_null} in the target - this is a constraint difference, not "
+                        f"necessarily a data problem, unless the stricter side is expected "
+                        f"to reject values the other side allows.",
+                    ])
+
+                if col.null_count_status == ValidationStatus.FAIL:
+                    table_issues.append([
+                        schema.schema_name, table.table, col.column, "Null Count Mismatch",
+                        f"Column '{col.column}' has {col.source_null_count} NULLs in the source "
+                        f"but {col.target_null_count} in the target - some rows likely gained or "
+                        f"lost a NULL value for this column during migration.",
+                    ])
+
+                if col.distinct_count_status == ValidationStatus.FAIL:
+                    table_issues.append([
+                        schema.schema_name, table.table, col.column, "Distinct Count Mismatch",
+                        f"Column '{col.column}' has {col.source_distinct_count} distinct values "
+                        f"in the source but {col.target_distinct_count} in the target - check for "
+                        f"duplicate or collapsed values, or rows missing on one side.",
+                    ])
+
+                if col.min_max_status == ValidationStatus.FAIL:
+                    table_issues.append([
+                        schema.schema_name, table.table, col.column, "Min/Max Mismatch",
+                        f"Column '{col.column}' ranges from {col.source_min} to {col.source_max} "
+                        f"in the source but {col.target_min} to {col.target_max} in the target - "
+                        f"check for outlier rows unique to one side, or a truncated/extended value range.",
+                    ])
+
+            data = table.data
+            if data is not None:
+                if data.row_hash_mismatch_count and data.row_hash_mismatch_count > 0:
+                    table_issues.append([
+                        schema.schema_name, table.table, "-", "Row Data Mismatch",
+                        f"{data.row_hash_mismatch_count} row(s) "
+                        f"({data.row_hash_mismatch_percentage:.2f}%) differ between source and "
+                        f"target by primary key - see the 'Row Hash Mismatches' sheet for the "
+                        f"affected keys, and 'Data Mismatches' for the specific column(s) and "
+                        f"values, if available.",
+                    ])
+                elif data.status == ValidationStatus.FAIL and (
+                    (data.source_only_rows or 0) > 0 or (data.target_only_rows or 0) > 0
+                    or (data.changed_rows or 0) > 0
+                ):
+                    table_issues.append([
+                        schema.schema_name, table.table, "-", "Row Data Mismatch",
+                        f"Row-level comparison found {data.source_only_rows or 0} row(s) only in "
+                        f"the source, {data.target_only_rows or 0} only in the target, and "
+                        f"{data.changed_rows or 0} changed - see the 'Data Mismatches' sheet for detail.",
+                    ])
+                elif data.status == ValidationStatus.ERROR:
+                    table_issues.append([
+                        schema.schema_name, table.table, "-", "Row Data Comparison Error",
+                        f"Row-level comparison could not complete for this table"
+                        + (f": {data.error}" if data.error else " - see the Error column in Table Validation.")
+                    ])
+
+            if not table_issues:
+                # Table FAILed/ERRORed but none of the categories above
+                # explain why (e.g. an ERROR raised before any stage ran) -
+                # never leave a failed table unexplained.
+                table_issues.append([
+                    schema.schema_name, table.table, "-", "Unclassified",
+                    f"Table '{table.table}' has status {table.status.value} but the reason "
+                    f"doesn't match a known category here - check the Error column and "
+                    f"per-check status columns on the 'Table Validation' sheet for this table.",
+                ])
+
+            schema_only_issue = (
+                table.status == ValidationStatus.FAIL
+                and table.row_count_status != ValidationStatus.FAIL
+                and (table.data is None or table.data.status != ValidationStatus.FAIL)
+                and not any(issue[3] == "Row Data Mismatch" for issue in table_issues)
+            )
+            if schema_only_issue:
+                rows.append([
+                    schema.schema_name, table.table, "-", "Summary",
+                    f"Table '{table.table}' failed, but the row data matches "
+                    f"(row counts and row-hash/data comparison passed) - the failure "
+                    f"is caused entirely by the schema/constraint issue(s) below.",
+                ])
+            rows.extend(table_issues)
+
+    rows.sort(key=lambda r: (r[0], r[1]))
+    return rows
 
 
 def _build_summary_metrics(result: CatalogValidationResponse) -> List[Tuple[str, Any]]:
@@ -532,6 +705,31 @@ def _build_row_hash_mismatches_sheet(wb: Workbook, result: CatalogValidationResp
     _enable_filter(ws, len(ROW_HASH_HEADERS), last_row)
 
 
+def _build_suggestions_sheet(wb: Workbook, result: CatalogValidationResponse) -> None:
+    ws = wb.create_sheet("Suggestions")
+    rows = _build_suggestion_rows(result)
+
+    _write_header_row(ws, SUGGESTION_HEADERS)
+
+    row_idx = 2
+    for values in rows:
+        for col_idx, value in enumerate(values, start=1):
+            cell = ws.cell(row=row_idx, column=col_idx, value=value)
+            cell.font = VALUE_FONT
+            cell.border = THIN_BORDER
+            cell.alignment = Alignment(vertical="top", wrap_text=(col_idx == len(SUGGESTION_HEADERS)))
+        row_idx += 1
+
+    ws.column_dimensions[get_column_letter(1)].width = 18
+    ws.column_dimensions[get_column_letter(2)].width = 20
+    ws.column_dimensions[get_column_letter(3)].width = 16
+    ws.column_dimensions[get_column_letter(4)].width = 18
+    ws.column_dimensions[get_column_letter(5)].width = 90
+
+    ws.freeze_panes = ws.cell(row=2, column=1)
+    ws.auto_filter.ref = f"A1:{get_column_letter(len(SUGGESTION_HEADERS))}{max(row_idx - 1, 1)}"
+
+
 # ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
@@ -542,8 +740,8 @@ def generate_excel_report(
     """
     Render a CatalogValidationResponse as a formatted, multi-sheet .xlsx
     workbook: Summary, Table Validation, Column Validation, Data
-    Mismatches, Row Hash Mismatches. Returns the output_path for
-    convenience.
+    Mismatches, Row Hash Mismatches, Suggestions. Returns the output_path
+    for convenience.
     """
     logger.info(
         "Generating Excel report | source=%s | target=%s | -> %s",
@@ -557,6 +755,7 @@ def generate_excel_report(
     _build_column_validation_sheet(wb, result)
     _build_data_mismatches_sheet(wb, result)
     _build_row_hash_mismatches_sheet(wb, result)
+    _build_suggestions_sheet(wb, result)
 
     wb.save(output_path)
 
