@@ -147,6 +147,14 @@ Everything lives outside the repo, under your home directory:
   by construction, since it's written under your home directory rather
   than the working directory.
 
+Optional: `DATABRICKS_RETRY_TIMEOUT_SECONDS` (a plain environment variable,
+not part of `config.yaml`) raises the CloudFetch HTTP retry timeout above
+its 300-second default. On a slow or unstable network, downloading a
+large row-hash result set can legitimately take longer than that, causing
+a `Retry request would exceed Retry policy max retry duration` failure
+even though the query itself succeeded. Set it higher (e.g. `900` for 15
+minutes) if you hit this on large tables.
+
 A future version will replace manual credential entry with Azure CLI /
 Service Principal auth and Databricks CLI / OAuth login, without changing
 the config file format or any command usage above.

@@ -8,9 +8,12 @@ so these tests verify SQL-generation logic and result parsing only.
 
 from __future__ import annotations
 
+from unittest.mock import MagicMock
+
 import pandas as pd
 import pytest
 
+import table_validator.connectors.databricks_connector as databricks_connector_module
 from table_validator.connectors.databricks_connector import DatabricksConnector
 
 
@@ -402,3 +405,78 @@ def test_get_row_detail_for_row_numbers_wraps_exceptions(monkeypatch):
             row_numbers=[2],
             value_columns=["id"],
         )
+
+
+# ---------------------------------------------------------------------------
+# connect(): retry timeout override for slow/unstable CloudFetch downloads.
+# ---------------------------------------------------------------------------
+def test_connect_omits_retry_kwarg_by_default(monkeypatch):
+    """Without an explicit retry_timeout_seconds or
+    DATABRICKS_RETRY_TIMEOUT_SECONDS, connect() must not pass
+    _retry_stop_after_attempts_duration at all, preserving
+    databricks-sql-connector's own default (300s)."""
+    monkeypatch.delenv("DATABRICKS_RETRY_TIMEOUT_SECONDS", raising=False)
+    captured = {}
+
+    def fake_connect(**kwargs):
+        captured.update(kwargs)
+        return MagicMock()
+
+    monkeypatch.setattr(databricks_connector_module.sql, "connect", fake_connect)
+    connector = _connector()
+
+    connector.connect()
+
+    assert "_retry_stop_after_attempts_duration" not in captured
+
+
+def test_connect_passes_explicit_retry_timeout_seconds(monkeypatch):
+    monkeypatch.delenv("DATABRICKS_RETRY_TIMEOUT_SECONDS", raising=False)
+    captured = {}
+
+    def fake_connect(**kwargs):
+        captured.update(kwargs)
+        return MagicMock()
+
+    monkeypatch.setattr(databricks_connector_module.sql, "connect", fake_connect)
+    connector = DatabricksConnector(
+        host="h", token="t", http_path="p", retry_timeout_seconds=900.0
+    )
+
+    connector.connect()
+
+    assert captured["_retry_stop_after_attempts_duration"] == 900.0
+
+
+def test_connect_falls_back_to_retry_timeout_env_var(monkeypatch):
+    monkeypatch.setenv("DATABRICKS_RETRY_TIMEOUT_SECONDS", "1200")
+    captured = {}
+
+    def fake_connect(**kwargs):
+        captured.update(kwargs)
+        return MagicMock()
+
+    monkeypatch.setattr(databricks_connector_module.sql, "connect", fake_connect)
+    connector = _connector()
+
+    connector.connect()
+
+    assert captured["_retry_stop_after_attempts_duration"] == 1200.0
+
+
+def test_connect_explicit_arg_takes_priority_over_env_var(monkeypatch):
+    monkeypatch.setenv("DATABRICKS_RETRY_TIMEOUT_SECONDS", "1200")
+    captured = {}
+
+    def fake_connect(**kwargs):
+        captured.update(kwargs)
+        return MagicMock()
+
+    monkeypatch.setattr(databricks_connector_module.sql, "connect", fake_connect)
+    connector = DatabricksConnector(
+        host="h", token="t", http_path="p", retry_timeout_seconds=600.0
+    )
+
+    connector.connect()
+
+    assert captured["_retry_stop_after_attempts_duration"] == 600.0

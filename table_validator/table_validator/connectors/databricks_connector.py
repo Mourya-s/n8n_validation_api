@@ -14,6 +14,7 @@ from __future__ import annotations
 import datetime
 import logging
 import numbers
+import os
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple
 
 import pandas as pd
@@ -97,6 +98,7 @@ class DatabricksConnector:
         host: Optional[str] = None,
         token: Optional[str] = None,
         http_path: Optional[str] = None,
+        retry_timeout_seconds: Optional[float] = None,
     ) -> None:
         """
         host/token/http_path must be resolved by the caller before
@@ -104,11 +106,27 @@ class DatabricksConnector:
         get_databricks_token() for the token, and config.databricks.
         workspace_url/http_path for the rest. This connector does not
         read credentials from the environment itself.
+
+        retry_timeout_seconds overrides databricks-sql-connector's
+        CloudFetch HTTP retry policy (_retry_stop_after_attempts_duration),
+        which otherwise defaults to 300 seconds. On a slow or unstable
+        network, downloading a large row-hash result set can legitimately
+        take longer than that, causing a hard
+        "Retry request would exceed Retry policy max retry duration"
+        failure even though the query itself succeeded - raising this
+        gives a slow-but-working connection more time instead of giving
+        up. Falls back to the DATABRICKS_RETRY_TIMEOUT_SECONDS environment
+        variable, then the connector's own default, if not given.
         """
 
         self._host = host
         self._token = token
         self._http_path = http_path
+        self._retry_timeout_seconds = retry_timeout_seconds or (
+            float(os.environ["DATABRICKS_RETRY_TIMEOUT_SECONDS"])
+            if os.environ.get("DATABRICKS_RETRY_TIMEOUT_SECONDS")
+            else None
+        )
 
         if not self._host or not self._token:
             raise ValueError(
@@ -138,11 +156,17 @@ class DatabricksConnector:
 
         try:
 
-            self._connection = sql.connect(
-                server_hostname=self._host,
-                http_path=self._http_path,
-                access_token=self._token,
-            )
+            connect_kwargs: Dict[str, Any] = {
+                "server_hostname": self._host,
+                "http_path": self._http_path,
+                "access_token": self._token,
+            }
+            if self._retry_timeout_seconds is not None:
+                connect_kwargs["_retry_stop_after_attempts_duration"] = (
+                    self._retry_timeout_seconds
+                )
+
+            self._connection = sql.connect(**connect_kwargs)
 
             with self._connection.cursor() as cursor:
                 cursor.execute("SELECT 1")
