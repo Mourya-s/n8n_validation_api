@@ -63,6 +63,14 @@ def _configure_logging(verbose: bool, quiet: bool) -> None:
     logger = logging.getLogger("table_validator")
     logger.propagate = False
 
+    # Each CLI invocation must start with a clean handler set: leftover
+    # handlers from a previous invocation in the same process (e.g. every
+    # test in this suite drives the CLI through the same interpreter) can
+    # point at an already-closed/detached stream, causing "Logging error"
+    # noise on emit rather than the intended output.
+    for old_handler in list(logger.handlers):
+        logger.removeHandler(old_handler)
+
     if quiet:
         # No handler at all (not even a raised level) - otherwise Python's
         # logging module falls back to its own stderr "lastResort" handler
@@ -124,6 +132,9 @@ def info() -> None:
         "     Runs the comparison using the saved configuration and "
         "writes an Excel report (validation_report.xlsx by default). "
         "Prints a pass/fail summary in the terminal when it finishes.\n"
+        "     To write to a different file instead of overwriting the "
+        "default (e.g. if it's still open in Excel from a previous run):\n"
+        "       tablevalidator validate --output validation_report_new.xlsx\n"
         "\n"
         "  3. tablevalidator open\n"
         "     Opens the most recently generated report in your default "
@@ -135,7 +146,9 @@ def info() -> None:
         "existing report without opening it.\n"
         "\n"
         "Run 'tablevalidator <command> --help' for a command's full "
-        "options (e.g. tablevalidator validate --help)."
+        "options (e.g. tablevalidator validate --help).\n"
+        "\n"
+        "TO KEERTHIVASAN"
     )
 
 
@@ -292,11 +305,21 @@ def validate(
         if config.source_type == SourceType.DATABRICKS
         else None
     )
-    generate_excel_report(
-        result, str(output),
-        source_type=config.source_type.value,
-        enabled_validations=report_enabled_validations,
-    )
+    try:
+        generate_excel_report(
+            result, str(output),
+            source_type=config.source_type.value,
+            enabled_validations=report_enabled_validations,
+        )
+    except PermissionError:
+        typer.secho(
+            f"Could not write '{output}' - the file is open in Excel (or "
+            "another program) and locked for writing. Close it and re-run "
+            "'tablevalidator validate', or pass a different path with "
+            "--output.",
+            fg=typer.colors.RED,
+        )
+        raise typer.Exit(code=1)
 
     # ------------------------------------------------------------------
     # 8. Print a summary - per-table PASS/FAIL lines, then the same

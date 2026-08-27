@@ -297,6 +297,36 @@ def test_open_command_errors_cleanly_when_report_missing(tmp_path: Path, _never_
     _never_launch_a_real_app.assert_not_called()
 
 
+def test_validate_locked_report_file_errors_cleanly_not_traceback(tmp_path: Path) -> None:
+    config_path = _full_config(tmp_path)
+    output_path = tmp_path / "validation_report.xlsx"
+    mock_connector = _mock_databricks_connector()
+
+    with patch(
+        "table_validator.cli.main.DatabricksConnector", return_value=mock_connector
+    ), patch(
+        "table_validator.cli.main.get_databricks_token", return_value="dapi_fake"
+    ), patch(
+        "table_validator.cli.main.get_azure_credential", return_value=None
+    ), patch(
+        "table_validator.cli.main.generate_excel_report",
+        side_effect=PermissionError(13, "Permission denied"),
+    ):
+        result = runner.invoke(
+            app,
+            [
+                "validate",
+                "--config-path", str(config_path),
+                "--output", str(output_path),
+            ],
+        )
+
+    assert result.exit_code == 1
+    assert "open in Excel" in result.output
+    assert "--output" in result.output
+    assert "Traceback" not in result.output
+
+
 def test_validate_exits_nonzero_on_failed_validation(tmp_path: Path) -> None:
     config_path = _full_config(tmp_path)
     output_path = tmp_path / "validation_report.xlsx"
