@@ -1,30 +1,55 @@
 # table-validator
 
-CLI tool for validating data migrations between Azure (Blob Storage / SQL Database) and Databricks Delta Lake catalogs. Validates schema, column, row-count/statistics, and row-level data differences, and produces a multi-sheet Excel report.
+Cross-platform data migration validator. Compares a source table against a
+target Databricks table/catalog and reports whether the migration is
+correct: matching schema, row counts, column statistics, and (where a
+difference is found) the exact row/column that changed. Produces a
+multi-sheet Excel report and a pass/fail summary.
+
+Currently supported sources (target is always Databricks):
+
+- Databricks catalog &rarr; Databricks catalog
+- Azure Blob Storage (CSV / Excel / Parquet) &rarr; Databricks table
+- Azure SQL Database &rarr; Databricks catalog
+
+More source platforms can be added behind the same connector/validator
+interfaces described below.
 
 ## Install
 
-From the project directory (contains `pyproject.toml`):
+```bash
+pip install table-validator
+```
+
+From a local checkout (the directory containing `pyproject.toml`):
 
 ```bash
 pip install .
 ```
 
-For local development (editable install, so code changes take effect without reinstalling):
+For local development (editable install, so code changes take effect
+without reinstalling):
 
 ```bash
-pip install -e .
+pip install -e ".[dev]"
 ```
 
-This installs the `tablevalidator` command on your PATH.
+Either way, this installs the `tablevalidator` command on your PATH.
 
-## First run
+## CLI usage
+
+```bash
+tablevalidator info
+```
+
+Prints what the tool does and the commands below, in the order you'd
+normally run them.
 
 ```bash
 tablevalidator configure
 ```
 
-Walks you through an interactive wizard:
+Interactive wizard that walks you through:
 
 1. Azure Storage account + container (optional, skip if you don't have a Blob source) and account key
 2. Azure SQL server + database (optional, skip if you don't have a SQL source) and username/password
@@ -33,28 +58,98 @@ Walks you through an interactive wizard:
 5. Target table (catalog / schema / table)
 6. Which validations to run (catalog / schema / column / row)
 
-Then run the validation:
-
 ```bash
 tablevalidator validate
 ```
 
-This produces `validation_report.xlsx` in the current directory and prints a pass/fail summary to the console. Exit code is `0` if the overall result is PASS, non-zero otherwise (useful in CI).
-
-Useful flags:
+Runs the comparison using the saved configuration and writes
+`validation_report.xlsx` in the current directory, printing a pass/fail
+summary to the console. Exit code is `0` if the overall result is PASS,
+non-zero otherwise (useful in CI). Useful flags:
 
 ```bash
 tablevalidator validate --config-path /path/to/config.yaml --output /path/to/report.xlsx
 ```
 
+```bash
+tablevalidator open
+```
+
+Opens the most recently generated report in your default spreadsheet app.
+
+## Quickstart (Python API)
+
+Everything the CLI does is available as a library, built from the same
+public API exported by `table_validator/__init__.py`:
+
+```python
+from table_validator import (
+    load_config,
+    CatalogValidator,
+    CatalogValidationRequest,
+    DatabricksConnector,
+)
+from table_validator.auth.databricks_auth import get_databricks_token
+
+# Non-secret settings from ~/.table_validator/config.yaml
+# (see `tablevalidator configure`); secrets from ~/.table_validator/.env.
+config = load_config()
+token = get_databricks_token(config)
+
+# DatabricksConnector wants a bare hostname, not the full workspace URL
+host = config.databricks.workspace_url.replace("https://", "").split("/")[0]
+
+databricks = DatabricksConnector(
+    host=host,
+    token=token,
+    http_path=config.databricks.http_path,
+)
+
+validator = CatalogValidator(databricks)
+
+request = CatalogValidationRequest(
+    source_catalog="source_catalog_name",
+    target_catalog="target_catalog_name",
+    schemas=["sales"],          # optional: restrict scope
+    primary_keys={"sales.orders": ["order_id"]},  # optional: enables row-level diffing
+)
+
+result = validator.compare_catalogs(request)
+
+print(result.status)  # PASS / FAIL / ERROR / SKIPPED
+```
+
+Other public entry points exported from `table_validator`:
+
+- `AzureCsvValidator` / `AzureSqlValidator` — the Blob-CSV and Azure-SQL
+  equivalents of `CatalogValidator`, returning the same
+  `CatalogValidationResponse` shape.
+- `BlobCatalogValidator` — validates every file in an Azure Blob container
+  against like-named Databricks tables.
+- `AzureConnector` / `AzureSqlConnector` — the Azure-side connectors, for
+  building your own validation flow against a connector directly.
+- `ValidatorConfig`, `default_config`, `save_config`, `require_config`,
+  `ConfigNotFoundError` — the same config load/save layer the CLI wizard
+  uses, if you want to construct or persist configuration programmatically.
+
 ## Where config and secrets are stored
 
 Everything lives outside the repo, under your home directory:
 
-- `~/.table_validator/config.yaml` — non-secret configuration (table references, workspace URL, which validations are enabled). Safe to inspect or version-control separately if you want.
-- `~/.table_validator/.env` — credentials (Azure Storage key, Azure SQL username/password, Databricks personal access token), written in plaintext and restricted to owner read/write only (`chmod 600`, best-effort on Windows since NTFS doesn't map POSIX permission bits). **Never commit this file or add it inside the project repo** — it isn't, by construction, since it's written under your home directory rather than the working directory.
+- `~/.table_validator/config.yaml` — non-secret configuration (table
+  references, workspace URL, which validations are enabled). Safe to
+  inspect or version-control separately if you want.
+- `~/.table_validator/.env` — credentials (Azure Storage key, Azure SQL
+  username/password, Databricks personal access token), written in
+  plaintext and restricted to owner read/write only (`chmod 600`,
+  best-effort on Windows since NTFS doesn't map POSIX permission bits).
+  **Never commit this file or add it inside the project repo** — it isn't,
+  by construction, since it's written under your home directory rather
+  than the working directory.
 
-A future version will replace manual credential entry with Azure CLI / Service Principal auth and Databricks CLI / OAuth login, without changing the config file format or any command usage above.
+A future version will replace manual credential entry with Azure CLI /
+Service Principal auth and Databricks CLI / OAuth login, without changing
+the config file format or any command usage above.
 
 ## Development
 
@@ -62,3 +157,7 @@ A future version will replace manual credential entry with Azure CLI / Service P
 pip install -e ".[dev]"
 pytest
 ```
+
+## License
+
+MIT — see [LICENSE](LICENSE).

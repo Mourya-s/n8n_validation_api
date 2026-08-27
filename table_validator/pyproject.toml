@@ -1,37 +1,44 @@
 [build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+requires = ["setuptools>=68", "setuptools_scm>=8"]
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "table-validator"
-version = "0.1.0"
+dynamic = ["version"]
 description = "CLI tool for validating data migrations between Azure (Blob Storage / SQL Database) and Databricks Delta Lake catalogs"
 readme = "README.md"
 requires-python = ">=3.9"
-license = { text = "Proprietary" }
+license = { text = "MIT" }
 dependencies = [
     "typer>=0.12",
     "rich>=13.0",
     "questionary>=2.0",
-    "pydantic>=2",
-    "pyodbc",
-    "databricks-sql-connector",
-    "pandas",
-    "numpy",
-    "azure-storage-blob",
-    "openpyxl",
-    "pyarrow",
-    "PyYAML",
-    "python-dotenv",
+    "pydantic>=2.0",
+    "pyodbc>=4.0",
+    "databricks-sql-connector>=3.0",
+    "pandas>=2.0",
+    "numpy>=1.24",
+    "azure-storage-blob>=12.14",
+    "openpyxl>=3.1",
+    "pyarrow>=14.0",
+    "PyYAML>=6.0",
+    "python-dotenv>=1.0",
 ]
 
 [project.optional-dependencies]
 dev = [
-    "pytest",
+    "pytest>=7.0",
+    "ruff>=0.4",
+    "black>=24.0",
 ]
 
 [project.scripts]
 tablevalidator = "table_validator.cli.main:app"
 
-[tool.hatch.build.targets.wheel]
-packages = ["table_validator"]
+[tool.setuptools.packages.find]
+include = ["table_validator", "table_validator.*"]
+
+[tool.setuptools_scm]
+root = ".."
+tag_regex = "^v(?P<version>\\d+\\.\\d+\\.\\d+)$"
+fallback_version = "0.0.0"
