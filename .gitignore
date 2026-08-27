@@ -1,4 +1,9 @@
 # Environment / secrets
+# table_validator's config and credentials live at ~/.table_validator/
+# (config.yaml + .env), outside this repo entirely - nothing under that
+# path is ever written into the repo, so there is nothing to ignore here
+# for it. These entries only cover the legacy comparison-service/ .env
+# files, which stayed inside the repo tree.
 .env
 .env.*
 !.env.example
@@ -8,12 +13,15 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 .pytest_cache/
+build/
+dist/
 
 # Generated reports
 comparison-service/report.csv
 comparison-service/report.xlsx
 comparison-service/*.csv
 comparison-service/*.xlsx
+validation_report.xlsx
 ~$*.xlsx
 ~$*.xls
 

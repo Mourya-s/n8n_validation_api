@@ -1,0 +1,37 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "table-validator"
+version = "0.1.0"
+description = "CLI tool for validating data migrations between Azure (Blob Storage / SQL Database) and Databricks Delta Lake catalogs"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "Proprietary" }
+dependencies = [
+    "typer>=0.12",
+    "rich>=13.0",
+    "questionary>=2.0",
+    "pydantic>=2",
+    "pyodbc",
+    "databricks-sql-connector",
+    "pandas",
+    "numpy",
+    "azure-storage-blob",
+    "openpyxl",
+    "pyarrow",
+    "PyYAML",
+    "python-dotenv",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+]
+
+[project.scripts]
+tablevalidator = "table_validator.cli.main:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["table_validator"]
