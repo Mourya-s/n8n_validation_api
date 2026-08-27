@@ -88,6 +88,30 @@ class CatalogValidator:
         self.partition_prompt = partition_prompt
         logger.debug("CatalogValidator initialised")
 
+    @staticmethod
+    def _lookup_primary_key(
+        request: "CatalogValidationRequest",
+        schema_name: str,
+        table_name: str,
+    ) -> Optional[List[str]]:
+        """
+        Look up request.primary_keys (keyed by "schema.table" or bare
+        table name, as typed by the user into config.yaml/the wizard) for
+        the given schema_name/table_name.
+
+        schema_name/table_name here come from whatever casing Databricks'
+        information_schema actually returns, matched case-insensitively
+        against the catalog in compare_schemas/compare_tables - which
+        does not necessarily match the exact casing the user configured.
+        An exact-match dict lookup would silently miss a configured key
+        and fall through to the much more expensive ROW_NUMBER() fallback
+        with no indication why, so this normalizes both sides to
+        lowercase before comparing.
+        """
+        lowered = {k.lower(): v for k, v in request.primary_keys.items()}
+        key_lookup = f"{schema_name}.{table_name}".lower()
+        return lowered.get(key_lookup) or lowered.get(table_name.lower())
+
     # ------------------------------------------------------------------
     # Stage 1 + top-level orchestration
     # ------------------------------------------------------------------
@@ -697,10 +721,7 @@ class CatalogValidator:
 
         # Configured PK column missing from either side is also BLOCKING -
         # every later tier depends on being able to resolve a usable key.
-        key_lookup = f"{schema_name}.{table_name}"
-        configured_key = request.primary_keys.get(key_lookup) or request.primary_keys.get(
-            table_name
-        )
+        configured_key = self._lookup_primary_key(request, schema_name, table_name)
         if configured_key:
             common_lower = {c.lower() for c in common_cols}
             if any(k.lower() not in common_lower for k in configured_key):
@@ -1040,8 +1061,7 @@ class CatalogValidator:
             )
             return
 
-        key_lookup = f"{schema_name}.{table_name}"
-        key_columns = request.primary_keys.get(key_lookup) or request.primary_keys.get(table_name)
+        key_columns = self._lookup_primary_key(request, schema_name, table_name)
         candidates = self._partition_candidates(common_cols, key_columns)
 
         context = PartitionPromptContext(
@@ -1184,10 +1204,7 @@ class CatalogValidator:
             result.tier_reached = ValidationTier.ROW_HASH
 
             if not using_row_number_fallback:
-                key_lookup = f"{schema_name}.{table_name}"
-                key_columns = request.primary_keys.get(key_lookup) or request.primary_keys.get(
-                    table_name
-                )
+                key_columns = self._lookup_primary_key(request, schema_name, table_name)
                 mismatched_keys = [m.primary_key for m in mismatches if m.status == "MISMATCH"]
                 if key_columns and mismatched_keys:
                     self._tier5_column_diff(
@@ -1238,10 +1255,7 @@ class CatalogValidator:
         written straight to `result.data`, so multiple bucket calls
         aggregate instead of each overwriting the last.
         """
-        key_lookup = f"{schema_name}.{table_name}"
-        row_hash_key_columns = request.primary_keys.get(key_lookup) or request.primary_keys.get(
-            table_name
-        )
+        row_hash_key_columns = self._lookup_primary_key(request, schema_name, table_name)
 
         using_row_number_fallback = not row_hash_key_columns
         if using_row_number_fallback:
@@ -1470,10 +1484,7 @@ class CatalogValidator:
     ) -> DataValidationResult:
 
         mode = request.data_compare_mode
-        key = f"{schema_name}.{table_name}"
-        key_columns = request.primary_keys.get(key) or request.primary_keys.get(
-            table_name
-        )
+        key_columns = self._lookup_primary_key(request, schema_name, table_name)
 
         logger.info(
             "[compare_data] table=%s.%s | mode=%s | resolved_key_columns=%s",

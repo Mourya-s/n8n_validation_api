@@ -991,6 +991,46 @@ def test_tier5_column_diff_runs_for_mismatched_key_and_names_exact_column():
     assert detail.verified is True
 
 
+def test_primary_key_lookup_is_case_insensitive_against_catalog_metadata():
+    """request.primary_keys is keyed by whatever casing the user typed
+    into config.yaml/the wizard, but schema_name/table_name at lookup
+    time come from Databricks' information_schema (matched
+    case-insensitively against the catalog elsewhere in this file). A
+    primary key configured as "Bronze.Customers" must still be found for
+    the real "bronze.customers" table - an exact-match lookup would
+    silently miss it and fall through to the much slower ROW_NUMBER()
+    fallback instead of using the real configured key."""
+    connector = _mismatched_fingerprint_connector()
+    connector.get_row_hashes.side_effect = lambda catalog, schema, table, cols, pk, bucket_predicate=None: (
+        _hash_df([(1, "aaa"), (2, "bbb")])
+        if catalog == "cat_source"
+        else _hash_df([(1, "aaa"), (2, "zzz")])
+    )
+    connector.get_row_detail_for_keys.return_value = [
+        {
+            "key": {"id": 2},
+            "mismatched_columns": ["name"],
+            "source_values": {"name": "old-value"},
+            "target_values": {"name": "new-value"},
+            "source_row_hash": "bbb",
+            "target_row_hash": "zzz",
+        }
+    ]
+    validator = CatalogValidator(connector)
+
+    result = validator.compare_catalogs(
+        _request(primary_keys={"Bronze.Customers": ["id"]})
+    )
+    table = result.schemas[0].tables[0]
+
+    connector.get_row_hashes_by_row_number.assert_not_called()
+    assert connector.get_row_hashes.call_count == 2  # once per side (source, target)
+    connector.get_row_detail_for_keys.assert_called_once()
+    assert table.data.key_columns == ["id"]
+    assert table.tier_reached == ValidationTier.COLUMN_DIFF
+    assert table.data.sample_changed_detail[0].verified is True
+
+
 def test_tier5_column_diff_runs_for_row_number_fallback_when_mismatched():
     """No primary key configured -> row-number fallback is used for Tier
     4, but a real mismatch must still let Tier 5 attempt best-effort
