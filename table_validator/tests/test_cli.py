@@ -843,6 +843,106 @@ def test_validate_azure_sql_mismatched_schema_names_still_matches_via_schema_map
     assert "1 total" in result.output
 
 
+def test_databricks_validation_wires_schema_map_and_table_map_when_names_differ(
+    tmp_path: Path,
+) -> None:
+    """Regression test for a real user-reported bug: source and target
+    table/schema names that don't match by name (typo, rename, different
+    casing) silently produced 0 tables / SKIPPED with no error, even
+    though the user explicitly named both sides. _run_databricks_validation
+    must build schema_map/table_map from config.source_table/target_table
+    whenever those names differ, mirroring _run_sql_validation's existing
+    pattern."""
+    config_path = tmp_path / "config.yaml"
+    config = ValidatorConfig()
+    config.databricks.workspace_url = "https://adb-123.databricks.net"
+    config.databricks.http_path = "/sql/1.0/warehouses/abc123"
+    config.source_table.catalog = "src_cat"
+    config.source_table.schema_name = "bronze"
+    config.source_table.table = "jd_example_data_2"
+    config.target_table.catalog = "tgt_cat"
+    config.target_table.schema_name = "bronze"
+    config.target_table.table = "jd_example_data2"
+    save_config(config, config_path)
+    output_path = tmp_path / "validation_report.xlsx"
+
+    mock_connector = _mock_databricks_connector()
+    mock_connector.get_tables.side_effect = lambda catalog, schema: (
+        ["jd_example_data_2"] if catalog == "src_cat" else ["jd_example_data2"]
+    )
+
+    captured_requests = []
+    from table_validator.validators.catalog_validator import CatalogValidator
+
+    real_compare_catalogs = CatalogValidator.compare_catalogs
+
+    def spy_compare_catalogs(self, request):
+        captured_requests.append(request)
+        return real_compare_catalogs(self, request)
+
+    with patch(
+        "table_validator.cli.main.DatabricksConnector", return_value=mock_connector
+    ), patch(
+        "table_validator.cli.main.get_databricks_token", return_value="dapi_fake"
+    ), patch(
+        "table_validator.cli.main.get_azure_credential", return_value=None
+    ), patch.object(CatalogValidator, "compare_catalogs", spy_compare_catalogs):
+        result = runner.invoke(
+            app,
+            ["validate", "--config-path", str(config_path), "--output", str(output_path)],
+        )
+
+    assert len(captured_requests) == 1
+    request = captured_requests[0]
+    assert request.table_map == {"jd_example_data_2": "jd_example_data2"}
+    assert request.tables == ["jd_example_data_2"]
+    assert request.schema_map == {}  # schema names are identical here
+    assert result.exit_code == 0, result.output
+    # The mapped pair must actually be found and validated, not reported
+    # as 0 tables - same regression shape as the Azure SQL schema_map bug.
+    assert "0 total, 0 passed" not in result.output
+    assert "1 total" in result.output
+
+
+def test_databricks_validation_leaves_maps_empty_when_names_are_identical(
+    tmp_path: Path,
+) -> None:
+    """When source/target schema and table names already match (today's
+    common case), schema_map/table_map must stay empty - preserving
+    100% existing behavior."""
+    config_path = _full_config(tmp_path)  # identical bronze/customers on both sides
+    output_path = tmp_path / "validation_report.xlsx"
+    mock_connector = _mock_databricks_connector()
+
+    captured_requests = []
+    from table_validator.validators.catalog_validator import CatalogValidator
+
+    real_compare_catalogs = CatalogValidator.compare_catalogs
+
+    def spy_compare_catalogs(self, request):
+        captured_requests.append(request)
+        return real_compare_catalogs(self, request)
+
+    with patch(
+        "table_validator.cli.main.DatabricksConnector", return_value=mock_connector
+    ), patch(
+        "table_validator.cli.main.get_databricks_token", return_value="dapi_fake"
+    ), patch(
+        "table_validator.cli.main.get_azure_credential", return_value=None
+    ), patch.object(CatalogValidator, "compare_catalogs", spy_compare_catalogs):
+        runner.invoke(
+            app,
+            ["validate", "--config-path", str(config_path), "--output", str(output_path)],
+        )
+
+    assert len(captured_requests) == 1
+    request = captured_requests[0]
+    assert request.schema_map == {}
+    assert request.table_map == {}
+    assert request.schemas == ["bronze"]
+    assert request.tables == ["customers"]
+
+
 # ---------------------------------------------------------------------------
 # --verbose/--quiet: progress logging visibility, added after a real user
 # reported a multi-minute catalog-wide validate looking hung because no

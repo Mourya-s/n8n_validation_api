@@ -161,8 +161,8 @@ class CatalogValidator:
 
         # Stage 2/3/4: schemas
         try:
-            common_schemas, missing_schemas, extra_schemas = self.compare_schemas(
-                request.source_catalog, request.target_catalog
+            common_schema_pairs, missing_schemas, extra_schemas, explicit_schema_errors = (
+                self._resolve_schema_pairs(request)
             )
         except Exception as exc:
             logger.exception("Failed to compare schemas")
@@ -177,12 +177,15 @@ class CatalogValidator:
 
         if request.schemas:
             # Explicit schema scope: missing_schemas/extra_schemas must be
-            # restricted to it too, not just common_schemas - otherwise an
-            # unrelated schema difference elsewhere in the catalog (one
-            # the user never asked to compare) falsely fails this
-            # targeted run.
+            # restricted to it too, not just common_schema_pairs -
+            # otherwise an unrelated schema difference elsewhere in the
+            # catalog (one the user never asked to compare) falsely fails
+            # this targeted run. Filtered by the SOURCE-side name,
+            # matching AzureSqlValidator's convention.
             wanted = {s.lower() for s in request.schemas}
-            common_schemas = [s for s in common_schemas if s.lower() in wanted]
+            common_schema_pairs = [
+                (src, tgt) for src, tgt in common_schema_pairs if src.lower() in wanted
+            ]
             missing_schemas = [s for s in missing_schemas if s.lower() in wanted]
             extra_schemas = [s for s in extra_schemas if s.lower() in wanted]
         else:
@@ -205,14 +208,26 @@ class CatalogValidator:
                 )
             logger.info(
                 "Found %d matching schema(s) across both catalogs - comparing all.",
-                len(common_schemas),
+                len(common_schema_pairs),
             )
 
         schema_results: List[SchemaValidationResult] = []
 
-        for schema_name in common_schemas:
+        for source_schema, target_schema in common_schema_pairs:
             schema_results.append(
-                self._validate_schema(request, schema_name)
+                self._validate_schema(request, source_schema, target_schema)
+            )
+
+        for message in explicit_schema_errors:
+            logger.error(message)
+            schema_results.append(
+                SchemaValidationResult(
+                    schema_name="(unresolved schema mapping)",
+                    status=ValidationStatus.ERROR,
+                    exists_in_source=False,
+                    exists_in_target=False,
+                    error=message,
+                )
             )
 
         if not request.schemas:
@@ -220,7 +235,7 @@ class CatalogValidator:
             logger.info(
                 "Catalog-wide comparison scope: %d schema(s), %d table(s) total. "
                 "This may take a while.",
-                len(common_schemas), total_tables,
+                len(common_schema_pairs), total_tables,
             )
 
         summary = self._build_summary(schema_results, missing_schemas, extra_schemas)
@@ -296,32 +311,139 @@ class CatalogValidator:
 
         return common, missing, extra
 
+    # ------------------------------------------------------------------
+    # Schema pair resolution: identical-name intersection (compare_schemas,
+    # unchanged above) PLUS request.schema_map for explicitly-named pairs
+    # whose names differ between source and target. Mirrors
+    # AzureSqlValidator._compare_schemas' resolution logic (row_validator.py)
+    # so the two paths behave consistently, with one addition: a
+    # schema_map entry naming a schema that does not actually exist on
+    # either side produces an explicit error message instead of a silent
+    # no-op (the bug this feature exists to fix).
+    # ------------------------------------------------------------------
+    def _resolve_schema_pairs(
+        self,
+        request: CatalogValidationRequest,
+    ) -> Tuple[List[Tuple[str, str]], List[str], List[str], List[str]]:
+        """
+        Returns (common_pairs, missing, extra, explicit_pair_errors).
+
+        common_pairs is a list of (source_schema_name, target_schema_name)
+        - identical-name pairs from compare_schemas(), plus any
+        request.schema_map pairs that resolve to real schemas on both
+        sides (using each side's real casing). missing/extra are the
+        identical-name leftovers, with any name that a schema_map entry
+        successfully accounted for removed (a mapped schema should not
+        also show up as "missing" just because it didn't equal-match by
+        name). explicit_pair_errors carries a human-readable message for
+        every schema_map entry that names a schema that does not exist on
+        one side or the other, so it can be surfaced as a visible
+        ERROR/FAIL rather than a silent skip.
+        """
+        common, missing, extra = self.compare_schemas(
+            request.source_catalog, request.target_catalog
+        )
+
+        if not request.schema_map:
+            common_pairs = [(name, name) for name in common]
+            return common_pairs, missing, extra, []
+
+        common_pairs = [(name, name) for name in common]
+        missing_set = set(missing)
+        extra_set = set(extra)
+        explicit_pair_errors: List[str] = []
+
+        # Resolve against the full (unfiltered) schema lists on both
+        # sides, not just common/missing/extra, since a schema_map's
+        # source name might already be one of the "common" identical
+        # names (a no-op remap) or might name a schema only found via
+        # case-insensitive lookup.
+        try:
+            all_source_schemas = self.databricks.get_schemas(request.source_catalog)
+        except Exception:
+            all_source_schemas = []
+        try:
+            all_target_schemas = self.databricks.get_schemas(request.target_catalog)
+        except Exception:
+            all_target_schemas = []
+
+        source_by_lower = {s.lower(): s for s in all_source_schemas}
+        target_by_lower = {s.lower(): s for s in all_target_schemas}
+
+        existing_pairs_lower = {(s.lower(), t.lower()) for s, t in common_pairs}
+
+        for src_name, tgt_name in request.schema_map.items():
+            actual_source = source_by_lower.get(src_name.lower())
+            actual_target = target_by_lower.get(tgt_name.lower())
+
+            if actual_source is None or actual_target is None:
+                missing_side = []
+                if actual_source is None:
+                    missing_side.append(
+                        f"schema '{src_name}' does not exist in source catalog "
+                        f"'{request.source_catalog}'"
+                    )
+                if actual_target is None:
+                    missing_side.append(
+                        f"schema '{tgt_name}' does not exist in target catalog "
+                        f"'{request.target_catalog}'"
+                    )
+                explicit_pair_errors.append(
+                    f"Configured schema mapping '{src_name}' -> '{tgt_name}': "
+                    + "; ".join(missing_side)
+                )
+                continue
+
+            pair_key = (actual_source.lower(), actual_target.lower())
+            if pair_key in existing_pairs_lower:
+                continue
+
+            common_pairs.append((actual_source, actual_target))
+            existing_pairs_lower.add(pair_key)
+            missing_set.discard(actual_source)
+            extra_set.discard(actual_target)
+
+        common_pairs.sort(key=lambda pair: pair[0])
+        return (
+            common_pairs,
+            sorted(missing_set),
+            sorted(extra_set),
+            explicit_pair_errors,
+        )
+
     def _validate_schema(
         self,
         request: CatalogValidationRequest,
-        schema_name: str,
+        source_schema: str,
+        target_schema: str,
     ) -> SchemaValidationResult:
 
         try:
-            common_tables, missing_tables, extra_tables = self.compare_tables(
-                request.source_catalog, request.target_catalog, schema_name
+            common_table_pairs, missing_tables, extra_tables, explicit_pair_errors = (
+                self._resolve_table_pairs(request, source_schema, target_schema)
             )
         except Exception as exc:
-            logger.exception("Failed to compare tables for schema '%s'", schema_name)
+            logger.exception(
+                "Failed to compare tables for schema '%s' -> '%s'",
+                source_schema, target_schema,
+            )
             return SchemaValidationResult(
-                schema_name=schema_name,
+                schema_name=target_schema,
                 status=ValidationStatus.ERROR,
                 error=f"Unable to compare tables: {exc}",
             )
 
         if request.tables:
             # Explicit table scope: missing_tables/extra_tables must be
-            # restricted to it too, not just common_tables - otherwise an
-            # unrelated table difference elsewhere in the same schema
-            # (one the user never asked to compare) falsely fails this
-            # targeted run.
+            # restricted to it too, not just common_table_pairs -
+            # otherwise an unrelated table difference elsewhere in the
+            # same schema (one the user never asked to compare) falsely
+            # fails this targeted run. Filtered by the SOURCE-side name,
+            # matching AzureSqlValidator._validate_schema's convention.
             wanted = {t.lower() for t in request.tables}
-            common_tables = [t for t in common_tables if t.lower() in wanted]
+            common_table_pairs = [
+                (src, tgt) for src, tgt in common_table_pairs if src.lower() in wanted
+            ]
             missing_tables = [t for t in missing_tables if t.lower() in wanted]
             extra_tables = [t for t in extra_tables if t.lower() in wanted]
         else:
@@ -332,20 +454,32 @@ class CatalogValidator:
                 logger.warning(
                     "Tables present in source schema '%s.%s' but not in "
                     "target (skipped): %s",
-                    request.source_catalog, schema_name, missing_tables,
+                    request.source_catalog, source_schema, missing_tables,
                 )
             if extra_tables:
                 logger.warning(
                     "Tables present in target schema '%s.%s' but not in "
                     "source (skipped): %s",
-                    request.target_catalog, schema_name, extra_tables,
+                    request.target_catalog, target_schema, extra_tables,
                 )
 
         table_results: List[TableValidationResult] = []
 
-        for table_name in common_tables:
+        for source_table, target_table in common_table_pairs:
             table_results.append(
-                self._validate_table(request, schema_name, table_name)
+                self._validate_table(request, source_schema, target_schema, source_table, target_table)
+            )
+
+        for message in explicit_pair_errors:
+            table_results.append(
+                TableValidationResult(
+                    schema_name=target_schema,
+                    table="(unresolved table mapping)",
+                    status=ValidationStatus.ERROR,
+                    exists_in_source=False,
+                    exists_in_target=False,
+                    error=message,
+                )
             )
 
         statuses = [t.status for t in table_results]
@@ -355,11 +489,114 @@ class CatalogValidator:
         status = self.calculate_overall_status(statuses)
 
         return SchemaValidationResult(
-            schema_name=schema_name,
+            schema_name=target_schema,
             status=status,
             missing_tables=missing_tables,
             extra_tables=extra_tables,
             tables=table_results,
+        )
+
+    # ------------------------------------------------------------------
+    # Table pair resolution: identical-name intersection (compare_tables,
+    # unchanged above) PLUS request.table_map for explicitly-named pairs
+    # whose names differ between source and target. Mirrors
+    # AzureSqlValidator._compare_tables' resolution logic (row_validator.py),
+    # with the same "explicit pair references a name that doesn't exist"
+    # error surfacing as _resolve_schema_pairs above.
+    # ------------------------------------------------------------------
+    def _resolve_table_pairs(
+        self,
+        request: CatalogValidationRequest,
+        source_schema: str,
+        target_schema: str,
+    ) -> Tuple[List[Tuple[str, str]], List[str], List[str], List[str]]:
+        """
+        Returns (common_pairs, missing, extra, explicit_pair_errors), same
+        shape/semantics as _resolve_schema_pairs but one level down (table
+        names within an already-resolved source_schema/target_schema
+        pair).
+        """
+        common, missing, extra = self.compare_tables(
+            request.source_catalog, request.target_catalog, source_schema
+        )
+
+        # NOTE: compare_tables() above assumes the same schema name on
+        # both sides. When source_schema != target_schema (a schema_map
+        # pair), that identical-name baseline is meaningless - re-derive
+        # it directly from each side's own schema.
+        if source_schema.lower() != target_schema.lower():
+            try:
+                source_tables = set(self.databricks.get_tables(request.source_catalog, source_schema))
+            except Exception:
+                source_tables = set()
+            try:
+                target_tables = set(self.databricks.get_tables(request.target_catalog, target_schema))
+            except Exception:
+                target_tables = set()
+            common = sorted(source_tables & target_tables)
+            missing = sorted(source_tables - target_tables)
+            extra = sorted(target_tables - source_tables)
+
+        if not request.table_map:
+            common_pairs = [(name, name) for name in common]
+            return common_pairs, missing, extra, []
+
+        common_pairs = [(name, name) for name in common]
+        missing_set = set(missing)
+        extra_set = set(extra)
+        explicit_pair_errors: List[str] = []
+
+        try:
+            all_source_tables = self.databricks.get_tables(request.source_catalog, source_schema)
+        except Exception:
+            all_source_tables = []
+        try:
+            all_target_tables = self.databricks.get_tables(request.target_catalog, target_schema)
+        except Exception:
+            all_target_tables = []
+
+        source_by_lower = {t.lower(): t for t in all_source_tables}
+        target_by_lower = {t.lower(): t for t in all_target_tables}
+
+        existing_pairs_lower = {(s.lower(), t.lower()) for s, t in common_pairs}
+
+        for src_name, tgt_name in request.table_map.items():
+            actual_source = source_by_lower.get(src_name.lower())
+            actual_target = target_by_lower.get(tgt_name.lower())
+
+            if actual_source is None or actual_target is None:
+                missing_side = []
+                if actual_source is None:
+                    missing_side.append(
+                        f"table '{src_name}' does not exist in source schema "
+                        f"'{request.source_catalog}.{source_schema}'"
+                    )
+                if actual_target is None:
+                    missing_side.append(
+                        f"table '{tgt_name}' does not exist in target schema "
+                        f"'{request.target_catalog}.{target_schema}'"
+                    )
+                explicit_pair_errors.append(
+                    f"Configured table mapping '{src_name}' -> '{tgt_name}': "
+                    + "; ".join(missing_side)
+                )
+                continue
+
+            pair_key = (actual_source.lower(), actual_target.lower())
+            if pair_key in existing_pairs_lower:
+                continue
+
+            common_pairs.append((actual_source, actual_target))
+            existing_pairs_lower.add(pair_key)
+            missing_set.discard(actual_source)
+            extra_set.discard(actual_target)
+
+        common_pairs.sort(key=lambda pair: pair[0])
+        return (
+            common_pairs,
+            sorted(missing_set),
+            sorted(extra_set),
+            explicit_pair_errors,
         )
 
     # ------------------------------------------------------------------
@@ -387,28 +624,45 @@ class CatalogValidator:
     def _validate_table(
         self,
         request: CatalogValidationRequest,
-        schema_name: str,
-        table_name: str,
+        source_schema: str,
+        target_schema: str,
+        source_table: str,
+        target_table: str,
     ) -> TableValidationResult:
 
         # Deliberately a plain, uncluttered progress line (unlike the
         # detailed [row-hash]/stats logging further down) - this is what
         # a user watching the console during a large catalog-wide run
         # needs to see to know the tool is progressing, not stalled.
-        logger.info("Validating table '%s.%s' ...", schema_name, table_name)
+        # Uses the TARGET-side name, matching the reporting convention
+        # (TableValidationResult.schema_name/table below) - unless the
+        # source-side name actually differs, in which case both are
+        # logged for clarity.
+        if source_schema.lower() == target_schema.lower() and source_table.lower() == target_table.lower():
+            logger.info("Validating table '%s.%s' ...", target_schema, target_table)
+        else:
+            logger.info(
+                "Validating table '%s.%s' (source) -> '%s.%s' (target) ...",
+                source_schema, source_table, target_schema, target_table,
+            )
 
-        result = TableValidationResult(schema_name=schema_name, table=table_name)
+        result = TableValidationResult(schema_name=target_schema, table=target_table)
+        if source_schema.lower() != target_schema.lower():
+            result.source_schema_name = source_schema
+        if source_table.lower() != target_table.lower():
+            result.source_table_name = source_table
 
         try:
             source_schema_df = self.databricks.get_table_schema(
-                request.source_catalog, schema_name, table_name
+                request.source_catalog, source_schema, source_table
             )
             target_schema_df = self.databricks.get_table_schema(
-                request.target_catalog, schema_name, table_name
+                request.target_catalog, target_schema, target_table
             )
         except Exception as exc:
             logger.exception(
-                "Failed to retrieve column metadata for '%s.%s'", schema_name, table_name
+                "Failed to retrieve column metadata for '%s.%s' -> '%s.%s'",
+                source_schema, source_table, target_schema, target_table,
             )
             result.status = ValidationStatus.ERROR
             result.error = f"Unable to retrieve column metadata: {exc}"
@@ -422,7 +676,7 @@ class CatalogValidator:
         # NON-BLOCKING difference (nullable, column order) is recorded
         # but execution continues into Tier 1+.
         blocking, common_cols = self._tier0_schema(
-            request, schema_name, table_name, source_schema_df, target_schema_df, result,
+            request, target_schema, target_table, source_schema_df, target_schema_df, result,
         )
 
         if blocking:
@@ -431,7 +685,7 @@ class CatalogValidator:
             logger.info(
                 "[tier0-schema] table=%s.%s | BLOCKING schema difference - aborting, "
                 "no further tier will run",
-                schema_name, table_name,
+                target_schema, target_table,
             )
             if not common_cols:
                 result.error = "No common columns between source and target"
@@ -472,7 +726,8 @@ class CatalogValidator:
         # Row Hash Mismatches sheets, rather than leaving a confirmed
         # difference with no row-level detail at all.
         stats_mismatch = self._tier1_statistics(
-            request, schema_name, table_name, common_cols, source_schema_df, result,
+            request, source_schema, target_schema, source_table, target_table,
+            common_cols, source_schema_df, result,
         )
 
         stats_only_ceiling = request.max_tier == ValidationTier.STATISTICAL
@@ -481,7 +736,7 @@ class CatalogValidator:
             result.tier_reached = ValidationTier.STATISTICAL
             logger.info(
                 "[tier1-statistics] table=%s.%s | stopping here - --mode=stats requested",
-                schema_name, table_name,
+                target_schema, target_table,
             )
             result.data = DataValidationResult(
                 mode=request.data_compare_mode,
@@ -506,7 +761,7 @@ class CatalogValidator:
             logger.info(
                 "[tier1-statistics] table=%s.%s | statistical mismatch found - "
                 "proceeding to Tier 2+ to locate the exact differing row(s)",
-                schema_name, table_name,
+                target_schema, target_table,
             )
 
         # Tier 2: whole-table fingerprint. Match -> tables are equal per
@@ -516,7 +771,7 @@ class CatalogValidator:
         # happens to collide (e.g. a min/max-only mismatch on a column
         # excluded from hashing).
         fingerprint_matches = self._tier2_fingerprint(
-            request, schema_name, table_name, common_cols, result,
+            request, source_schema, target_schema, source_table, target_table, common_cols, result,
         )
 
         if fingerprint_matches and not stats_mismatch:
@@ -524,12 +779,12 @@ class CatalogValidator:
             logger.info(
                 "[tier2-fingerprint] table=%s.%s | stopping here - fingerprint "
                 "matched, tables are equal (no row-hash SQL will run)",
-                schema_name, table_name,
+                target_schema, target_table,
             )
         else:
             logger.info(
                 "[tier2-fingerprint] table=%s.%s | %s - proceeding to Tier 4 row-hash diff",
-                schema_name, table_name,
+                target_schema, target_table,
                 "mismatch" if not fingerprint_matches else "fingerprint matched but "
                 "Tier 1 already confirmed a mismatch",
             )
@@ -552,7 +807,8 @@ class CatalogValidator:
             # Tier 3 (optional, large confirmed-mismatched tables only) +
             # Tier 4 (+ Tier 5 for any ROW_HASH_MISMATCH keys).
             self._dispatch_tier4(
-                request, schema_name, table_name, common_cols, result,
+                request, source_schema, target_schema, source_table, target_table,
+                common_cols, result,
                 stats_mismatch=stats_mismatch,
             )
 
@@ -811,8 +1067,10 @@ class CatalogValidator:
     def _tier1_statistics(
         self,
         request: CatalogValidationRequest,
-        schema_name: str,
-        table_name: str,
+        source_schema: str,
+        target_schema: str,
+        source_table: str,
+        target_table: str,
         common_cols: List[str],
         source_schema_df: pd.DataFrame,
         result: TableValidationResult,
@@ -824,10 +1082,10 @@ class CatalogValidator:
         # Row count (also serves stage "row_count_status" as before).
         try:
             src_count = self.databricks.get_row_count(
-                request.source_catalog, schema_name, table_name
+                request.source_catalog, source_schema, source_table
             )
             tgt_count = self.databricks.get_row_count(
-                request.target_catalog, schema_name, table_name
+                request.target_catalog, target_schema, target_table
             )
             result.row_count_source = src_count
             result.row_count_target = tgt_count
@@ -837,7 +1095,7 @@ class CatalogValidator:
                 mismatch = True
         except Exception as exc:
             logger.exception(
-                "Failed to compute row counts for '%s.%s'", schema_name, table_name
+                "Failed to compute row counts for '%s.%s'", target_schema, target_table
             )
             result.row_count_status = ValidationStatus.ERROR
             result.error = f"Row count failed: {exc}"
@@ -855,17 +1113,17 @@ class CatalogValidator:
 
         try:
             source_stats = self.databricks.get_column_statistics(
-                request.source_catalog, schema_name, table_name,
+                request.source_catalog, source_schema, source_table,
                 common_cols, min_max_columns,
             )
             target_stats = self.databricks.get_column_statistics(
-                request.target_catalog, schema_name, table_name,
+                request.target_catalog, target_schema, target_table,
                 common_cols, min_max_columns,
             )
             stats_error = None
         except Exception as exc:
             logger.exception(
-                "Failed to compute column statistics for '%s.%s'", schema_name, table_name
+                "Failed to compute column statistics for '%s.%s'", target_schema, target_table
             )
             source_stats, target_stats = {}, {}
             stats_error = str(exc)
@@ -957,8 +1215,10 @@ class CatalogValidator:
     def _tier2_fingerprint(
         self,
         request: CatalogValidationRequest,
-        schema_name: str,
-        table_name: str,
+        source_schema: str,
+        target_schema: str,
+        source_table: str,
+        target_table: str,
         common_cols: List[str],
         result: TableValidationResult,
     ) -> bool:
@@ -967,14 +1227,14 @@ class CatalogValidator:
 
         try:
             source_fp = self.databricks.get_table_fingerprint(
-                request.source_catalog, schema_name, table_name, value_columns,
+                request.source_catalog, source_schema, source_table, value_columns,
             )
             target_fp = self.databricks.get_table_fingerprint(
-                request.target_catalog, schema_name, table_name, value_columns,
+                request.target_catalog, target_schema, target_table, value_columns,
             )
         except Exception as exc:
             logger.exception(
-                "Failed to compute table fingerprint for '%s.%s'", schema_name, table_name
+                "Failed to compute table fingerprint for '%s.%s'", target_schema, target_table
             )
             result.data = DataValidationResult(
                 mode=request.data_compare_mode,
@@ -992,7 +1252,7 @@ class CatalogValidator:
 
         logger.info(
             "[tier2-fingerprint] table=%s.%s | match=%s | source=%s | target=%s",
-            schema_name, table_name, matches, source_fp, target_fp,
+            target_schema, target_table, matches, source_fp, target_fp,
         )
 
         result.data = DataValidationResult(
@@ -1036,8 +1296,10 @@ class CatalogValidator:
     def _dispatch_tier4(
         self,
         request: CatalogValidationRequest,
-        schema_name: str,
-        table_name: str,
+        source_schema: str,
+        target_schema: str,
+        source_table: str,
+        target_table: str,
         common_cols: List[str],
         result: TableValidationResult,
         stats_mismatch: bool = False,
@@ -1048,7 +1310,8 @@ class CatalogValidator:
         if not large_enough:
             result.partition_skip_reason = None  # too small to even offer
             self._tier4_and_5_row_level(
-                request, schema_name, table_name, common_cols, result,
+                request, source_schema, target_schema, source_table, target_table,
+                common_cols, result,
                 stats_mismatch=stats_mismatch,
             )
             return
@@ -1056,17 +1319,23 @@ class CatalogValidator:
         if self.partition_prompt is None:
             result.partition_skip_reason = "no partition_prompt configured"
             self._tier4_and_5_row_level(
-                request, schema_name, table_name, common_cols, result,
+                request, source_schema, target_schema, source_table, target_table,
+                common_cols, result,
                 stats_mismatch=stats_mismatch,
             )
             return
 
-        key_columns = self._lookup_primary_key(request, schema_name, table_name)
+        # Keyed by TARGET-side name, same convention as _lookup_primary_key
+        # everywhere else (this is what the user types into config as
+        # "target_table.table"). common_cols is the already-agreed common
+        # column list, so it's identical regardless of which side's names
+        # are used for the partition candidate list/UI prompt.
+        key_columns = self._lookup_primary_key(request, target_schema, target_table)
         candidates = self._partition_candidates(common_cols, key_columns)
 
         context = PartitionPromptContext(
-            schema_name=schema_name,
-            table=table_name,
+            schema_name=target_schema,
+            table=target_table,
             row_count=row_count,
             candidate_columns=candidates,
         )
@@ -1077,20 +1346,22 @@ class CatalogValidator:
             logger.exception(
                 "partition_prompt callback failed for '%s.%s' - falling back "
                 "to unpartitioned Tier 4",
-                schema_name, table_name,
+                target_schema, target_table,
             )
             chosen_column = None
 
         if not chosen_column:
             result.partition_skip_reason = "user declined or non-interactive run"
             self._tier4_and_5_row_level(
-                request, schema_name, table_name, common_cols, result,
+                request, source_schema, target_schema, source_table, target_table,
+                common_cols, result,
                 stats_mismatch=stats_mismatch,
             )
             return
 
         self._tier3_partition_and_tier4(
-            request, schema_name, table_name, common_cols, result,
+            request, source_schema, target_schema, source_table, target_table,
+            common_cols, result,
             chosen_column, stats_mismatch=stats_mismatch,
         )
 
@@ -1104,8 +1375,10 @@ class CatalogValidator:
     def _tier3_partition_and_tier4(
         self,
         request: CatalogValidationRequest,
-        schema_name: str,
-        table_name: str,
+        source_schema: str,
+        target_schema: str,
+        source_table: str,
+        target_table: str,
         common_cols: List[str],
         result: TableValidationResult,
         bucket_column: str,
@@ -1115,20 +1388,21 @@ class CatalogValidator:
 
         try:
             source_buckets = self.databricks.get_table_fingerprint_by_bucket(
-                request.source_catalog, schema_name, table_name, value_columns, bucket_column,
+                request.source_catalog, source_schema, source_table, value_columns, bucket_column,
             )
             target_buckets = self.databricks.get_table_fingerprint_by_bucket(
-                request.target_catalog, schema_name, table_name, value_columns, bucket_column,
+                request.target_catalog, target_schema, target_table, value_columns, bucket_column,
             )
         except Exception as exc:
             logger.exception(
                 "Tier 3 bucket fingerprint failed for '%s.%s' (bucket_column='%s') - "
                 "falling back to unpartitioned Tier 4",
-                schema_name, table_name, bucket_column,
+                target_schema, target_table, bucket_column,
             )
             result.partition_skip_reason = f"bucket fingerprint failed: {exc}"
             self._tier4_and_5_row_level(
-                request, schema_name, table_name, common_cols, result,
+                request, source_schema, target_schema, source_table, target_table,
+                common_cols, result,
                 stats_mismatch=stats_mismatch,
             )
             return
@@ -1155,7 +1429,7 @@ class CatalogValidator:
         logger.info(
             "[tier3-partition] table=%s.%s | bucket_column=%s | total_buckets=%d | "
             "culprit_buckets=%d",
-            schema_name, table_name, bucket_column, len(all_buckets), len(culprit_buckets),
+            target_schema, target_table, bucket_column, len(all_buckets), len(culprit_buckets),
         )
 
         result.partitioned = True
@@ -1170,7 +1444,8 @@ class CatalogValidator:
         }
         for bucket_value in culprit_buckets:
             self._tier4_and_5_row_level(
-                request, schema_name, table_name, common_cols, result,
+                request, source_schema, target_schema, source_table, target_table,
+                common_cols, result,
                 stats_mismatch=stats_mismatch,
                 bucket_predicate=(bucket_column, bucket_value),
                 _accumulate=accumulate,
@@ -1204,11 +1479,12 @@ class CatalogValidator:
             result.tier_reached = ValidationTier.ROW_HASH
 
             if not using_row_number_fallback:
-                key_columns = self._lookup_primary_key(request, schema_name, table_name)
+                key_columns = self._lookup_primary_key(request, target_schema, target_table)
                 mismatched_keys = [m.primary_key for m in mismatches if m.status == "MISMATCH"]
                 if key_columns and mismatched_keys:
                     self._tier5_column_diff(
-                        request, schema_name, table_name, common_cols,
+                        request, source_schema, target_schema, source_table, target_table,
+                        common_cols,
                         key_columns, mismatched_keys, result,
                     )
                     result.tier_reached = ValidationTier.COLUMN_DIFF
@@ -1237,8 +1513,10 @@ class CatalogValidator:
     def _tier4_and_5_row_level(
         self,
         request: CatalogValidationRequest,
-        schema_name: str,
-        table_name: str,
+        source_schema: str,
+        target_schema: str,
+        source_table: str,
+        target_table: str,
         common_cols: List[str],
         result: TableValidationResult,
         stats_mismatch: bool = False,
@@ -1255,7 +1533,7 @@ class CatalogValidator:
         written straight to `result.data`, so multiple bucket calls
         aggregate instead of each overwriting the last.
         """
-        row_hash_key_columns = self._lookup_primary_key(request, schema_name, table_name)
+        row_hash_key_columns = self._lookup_primary_key(request, target_schema, target_table)
 
         using_row_number_fallback = not row_hash_key_columns
         if using_row_number_fallback:
@@ -1264,19 +1542,20 @@ class CatalogValidator:
                 "ROW_NUMBER()-based comparison (ORDER BY every common column). "
                 "Best-effort only: reliable solely when both sides have the same "
                 "row set.",
-                schema_name, table_name,
+                target_schema, target_table,
             )
 
         try:
             if using_row_number_fallback:
                 mismatches, mismatch_count, mismatch_pct = self._run_row_hash_stage_by_row_number(
-                    request, schema_name, table_name, common_cols,
+                    request, source_schema, target_schema, source_table, target_table, common_cols,
                     bucket_predicate=bucket_predicate,
                 )
                 effective_key_columns = ["row_number"]
             else:
                 mismatches, mismatch_count, mismatch_pct = self._run_row_hash_stage(
-                    request, schema_name, table_name, common_cols, row_hash_key_columns,
+                    request, source_schema, target_schema, source_table, target_table,
+                    common_cols, row_hash_key_columns,
                     bucket_predicate=bucket_predicate,
                 )
                 effective_key_columns = row_hash_key_columns
@@ -1288,7 +1567,7 @@ class CatalogValidator:
 
             logger.info(
                 "[row-hash] table=%s.%s | key_columns=%s | mismatch_count=%s | mismatch_pct=%.2f%%",
-                schema_name, table_name, effective_key_columns, mismatch_count, mismatch_pct,
+                target_schema, target_table, effective_key_columns, mismatch_count, mismatch_pct,
             )
 
             if _accumulate is not None:
@@ -1336,7 +1615,8 @@ class CatalogValidator:
                 ]
                 if mismatched_keys:
                     self._tier5_column_diff(
-                        request, schema_name, table_name, common_cols,
+                        request, source_schema, target_schema, source_table, target_table,
+                        common_cols,
                         effective_key_columns, mismatched_keys, result,
                         using_row_number_fallback=using_row_number_fallback,
                         bucket_predicate=bucket_predicate,
@@ -1364,7 +1644,7 @@ class CatalogValidator:
                 result.tier_reached = ValidationTier.ROW_HASH
         except Exception as exc:
             logger.exception(
-                "Failed to run row-hash comparison for '%s.%s'", schema_name, table_name
+                "Failed to run row-hash comparison for '%s.%s'", target_schema, target_table
             )
             if result.data is None:
                 result.data = DataValidationResult(
@@ -1385,8 +1665,10 @@ class CatalogValidator:
     def _tier5_column_diff(
         self,
         request: CatalogValidationRequest,
-        schema_name: str,
-        table_name: str,
+        source_schema: str,
+        target_schema: str,
+        source_table: str,
+        target_table: str,
         common_cols: List[str],
         key_columns: List[str],
         mismatched_keys: List[str],
@@ -1394,6 +1676,19 @@ class CatalogValidator:
         using_row_number_fallback: bool = False,
         bucket_predicate: Optional[Tuple[str, Any]] = None,
     ) -> None:
+        # NOTE: DatabricksConnector.get_row_detail_for_keys/
+        # get_row_detail_for_row_numbers each take a single schema/table
+        # pair used to qualify BOTH source_catalog and target_catalog
+        # (they assume the schema/table name is shared) - an asymmetric
+        # schema_map/table_map pair therefore re-queries both sides under
+        # the TARGET-side name, matching the reporting convention used
+        # everywhere else in this class. Widening those connector methods
+        # to accept independent source/target schema+table names is out
+        # of scope for this change; today this only matters when the
+        # source-side name doesn't actually exist under the target's own
+        # catalog, which would already have been caught as a BLOCKING
+        # Tier 0 schema difference or a missing-table pair error before
+        # Tier 5 could ever run.
         if using_row_number_fallback:
             # No real key to exclude - every common column is a value
             # column. This MUST match the column list/order used to
@@ -1425,8 +1720,8 @@ class CatalogValidator:
                 detail = self.databricks.get_row_detail_for_row_numbers(
                     source_catalog=request.source_catalog,
                     target_catalog=request.target_catalog,
-                    schema=schema_name,
-                    table=table_name,
+                    schema=target_schema,
+                    table=target_table,
                     order_by_columns=value_columns,
                     row_numbers=[int(k) for k in mismatched_keys],
                     value_columns=value_columns,
@@ -1437,8 +1732,8 @@ class CatalogValidator:
                 detail = self.databricks.get_row_detail_for_keys(
                     source_catalog=request.source_catalog,
                     target_catalog=request.target_catalog,
-                    schema=schema_name,
-                    table=table_name,
+                    schema=target_schema,
+                    table=target_table,
                     key_column=key_columns[0],
                     key_values=mismatched_keys,
                     value_columns=value_columns,
@@ -1446,7 +1741,7 @@ class CatalogValidator:
                 )
         except Exception as exc:
             logger.exception(
-                "Tier 5 column diff failed for '%s.%s'", schema_name, table_name
+                "Tier 5 column diff failed for '%s.%s'", target_schema, target_table
             )
             if result.data is not None:
                 result.data.error = f"Column-level diff failed: {exc}"
@@ -1457,8 +1752,8 @@ class CatalogValidator:
             for col in row["mismatched_columns"]:
                 sample_changed_detail.append(
                     RowMismatchDetail(
-                        schema_name=schema_name,
-                        table=table_name,
+                        schema_name=target_schema,
+                        table=target_table,
                         primary_key=row["key"],
                         mismatch_column=col,
                         source_value=row["source_values"].get(col),
@@ -1478,17 +1773,19 @@ class CatalogValidator:
     def compare_data(
         self,
         request: CatalogValidationRequest,
-        schema_name: str,
-        table_name: str,
+        source_schema: str,
+        target_schema: str,
+        source_table: str,
+        target_table: str,
         common_columns: List[str],
     ) -> DataValidationResult:
 
         mode = request.data_compare_mode
-        key_columns = self._lookup_primary_key(request, schema_name, table_name)
+        key_columns = self._lookup_primary_key(request, target_schema, target_table)
 
         logger.info(
             "[compare_data] table=%s.%s | mode=%s | resolved_key_columns=%s",
-            schema_name, table_name, mode.value, key_columns,
+            target_schema, target_table, mode.value, key_columns,
         )
 
         if mode == DataCompareMode.COUNT_ONLY:
@@ -1514,9 +1811,10 @@ class CatalogValidator:
                 mode=mode,
                 status=ValidationStatus.SKIPPED,
                 note=(
-                    f"No primary/business key configured for '{key}' - "
-                    "row-level data comparison requires a key and was skipped. "
-                    "Configure request.primary_keys to enable it."
+                    f"No primary/business key configured for "
+                    f"'{target_schema}.{target_table}' - row-level data comparison "
+                    "requires a key and was skipped. Configure request.primary_keys "
+                    "to enable it."
                 ),
             )
 
@@ -1533,8 +1831,8 @@ class CatalogValidator:
             c for c in common_columns if c.lower() not in {k.lower() for k in key_columns}
         ]
 
-        source_fqtn = f"{request.source_catalog}.{schema_name}.{table_name}"
-        target_fqtn = f"{request.target_catalog}.{schema_name}.{table_name}"
+        source_fqtn = f"{request.source_catalog}.{source_schema}.{source_table}"
+        target_fqtn = f"{request.target_catalog}.{target_schema}.{target_table}"
 
         try:
             diff = self.databricks.key_based_row_diff(
@@ -1548,7 +1846,8 @@ class CatalogValidator:
             )
         except Exception as exc:
             logger.exception(
-                "Failed to run key-based data comparison for '%s'", key
+                "Failed to run key-based data comparison for '%s.%s'",
+                target_schema, target_table,
             )
             return DataValidationResult(
                 mode=mode,
@@ -1566,7 +1865,7 @@ class CatalogValidator:
         logger.info(
             "[data-mismatch] table=%s.%s | mode=%s | source_only=%d | target_only=%d | "
             "changed_rows=%d | sample_changed_detail_rows=%d",
-            schema_name, table_name, mode.value,
+            target_schema, target_table, mode.value,
             diff["source_only_rows"], diff["target_only_rows"], diff["changed_rows"],
             len(diff.get("sample_changed_detail", [])),
         )
@@ -1577,8 +1876,8 @@ class CatalogValidator:
                 for col in row["mismatched_columns"]:
                     sample_changed_detail.append(
                         RowMismatchDetail(
-                            schema_name=schema_name,
-                            table=table_name,
+                            schema_name=target_schema,
+                            table=target_table,
                             primary_key=row["key"],
                             mismatch_column=col,
                             source_value=row["source_values"].get(col),
@@ -1620,8 +1919,10 @@ class CatalogValidator:
     def _run_row_hash_stage(
         self,
         request: CatalogValidationRequest,
-        schema_name: str,
-        table_name: str,
+        source_schema: str,
+        target_schema: str,
+        source_table: str,
+        target_table: str,
         common_columns: List[str],
         key_columns: List[str],
         bucket_predicate: Optional[Tuple[str, Any]] = None,
@@ -1634,22 +1935,22 @@ class CatalogValidator:
         logger.info(
             "[row-hash] fetching hashes | table=%s.%s | key_columns=%s | value_columns=%s"
             "%s",
-            schema_name, table_name, key_columns, value_columns,
+            target_schema, target_table, key_columns, value_columns,
             f" | bucket={bucket_predicate}" if bucket_predicate else "",
         )
 
         source_hashes = self.databricks.get_row_hashes(
-            request.source_catalog, schema_name, table_name, value_columns, key_columns,
+            request.source_catalog, source_schema, source_table, value_columns, key_columns,
             bucket_predicate=bucket_predicate,
         )
         target_hashes = self.databricks.get_row_hashes(
-            request.target_catalog, schema_name, table_name, value_columns, key_columns,
+            request.target_catalog, target_schema, target_table, value_columns, key_columns,
             bucket_predicate=bucket_predicate,
         )
 
         logger.info(
             "[row-hash] fetched | table=%s.%s | source_rows=%d | target_rows=%d",
-            schema_name, table_name, len(source_hashes), len(target_hashes),
+            target_schema, target_table, len(source_hashes), len(target_hashes),
         )
 
         return self.compare_row_hashes(source_hashes, target_hashes, key_columns)
@@ -1657,8 +1958,10 @@ class CatalogValidator:
     def _run_row_hash_stage_by_row_number(
         self,
         request: CatalogValidationRequest,
-        schema_name: str,
-        table_name: str,
+        source_schema: str,
+        target_schema: str,
+        source_table: str,
+        target_table: str,
         common_columns: List[str],
         bucket_predicate: Optional[Tuple[str, Any]] = None,
     ) -> Tuple[List[RowHashMismatch], int, float]:
@@ -1673,22 +1976,22 @@ class CatalogValidator:
 
         logger.info(
             "[row-hash] fetching row-number hashes | table=%s.%s | value_columns=%s%s",
-            schema_name, table_name, value_columns,
+            target_schema, target_table, value_columns,
             f" | bucket={bucket_predicate}" if bucket_predicate else "",
         )
 
         source_hashes = self.databricks.get_row_hashes_by_row_number(
-            request.source_catalog, schema_name, table_name, value_columns,
+            request.source_catalog, source_schema, source_table, value_columns,
             bucket_predicate=bucket_predicate,
         )
         target_hashes = self.databricks.get_row_hashes_by_row_number(
-            request.target_catalog, schema_name, table_name, value_columns,
+            request.target_catalog, target_schema, target_table, value_columns,
             bucket_predicate=bucket_predicate,
         )
 
         logger.info(
             "[row-hash] fetched row-number hashes | table=%s.%s | source_rows=%d | target_rows=%d",
-            schema_name, table_name, len(source_hashes), len(target_hashes),
+            target_schema, target_table, len(source_hashes), len(target_hashes),
         )
 
         return self.compare_row_hashes(source_hashes, target_hashes, ["row_number"])

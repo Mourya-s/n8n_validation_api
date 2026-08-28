@@ -1436,3 +1436,147 @@ def test_excel_report_omits_column_sections_when_column_not_selected():
     assert "Row Count (Src)" in headers
     assert "Data Match" in headers
     assert len(filtered_rows[0]) == len(headers)
+
+
+# ---------------------------------------------------------------------------
+# schema_map / table_map: explicit source-name -> target-name mapping
+# (regression coverage for the "differently-named source/target objects
+# silently report 0 tables / SKIPPED" bug).
+# ---------------------------------------------------------------------------
+def test_table_map_validates_explicit_pair_with_different_names():
+    """An explicit table_map entry ('jd_example_data_2' -> 'jd_example_data2')
+    must be validated directly even though compare_tables' plain name
+    intersection would find zero common tables (the two names never
+    equal-match)."""
+    connector = _make_connector()
+    connector.get_tables.side_effect = lambda catalog, schema: (
+        ["jd_example_data_2"] if catalog == "cat_source" else ["jd_example_data2"]
+    )
+    validator = CatalogValidator(connector)
+
+    result = validator.compare_catalogs(
+        _request(table_map={"jd_example_data_2": "jd_example_data2"})
+    )
+
+    schema_result = result.schemas[0]
+    # Plain-intersection missing/extra must not still flag this pair -
+    # the mapping accounts for it.
+    assert schema_result.missing_tables == []
+    assert schema_result.extra_tables == []
+    assert len(schema_result.tables) == 1
+    table = schema_result.tables[0]
+    # Target-side name is what's shown in the report (reporting convention).
+    assert table.table == "jd_example_data2"
+    assert table.source_table_name == "jd_example_data_2"
+    # The table was actually validated (statistics/etc. ran), not skipped.
+    assert table.status in (ValidationStatus.PASS, ValidationStatus.FAIL)
+    connector.get_row_count.assert_called()
+
+
+def test_table_map_to_nonexistent_target_table_produces_clear_error():
+    """A table_map entry naming a target table that does NOT exist must
+    produce a visible FAIL/ERROR with an informative message - never a
+    silent skip or omission."""
+    connector = _make_connector()
+    connector.get_tables.side_effect = lambda catalog, schema: (
+        ["customers"] if catalog == "cat_source" else ["customers"]
+    )
+    validator = CatalogValidator(connector)
+
+    result = validator.compare_catalogs(
+        _request(table_map={"customers": "does_not_exist_table"})
+    )
+
+    schema_result = result.schemas[0]
+    error_tables = [t for t in schema_result.tables if t.status == ValidationStatus.ERROR]
+    assert len(error_tables) == 1
+    assert "does_not_exist_table" in error_tables[0].error
+    assert "does not exist" in error_tables[0].error
+    assert schema_result.status in (ValidationStatus.ERROR, ValidationStatus.FAIL)
+    assert result.status in (ValidationStatus.ERROR, ValidationStatus.FAIL)
+
+
+def test_schema_map_validates_explicit_pair_with_different_names():
+    """Same idea one level up: an explicit schema_map entry must be
+    validated directly even though compare_schemas' plain name
+    intersection would find zero common schemas."""
+    connector = _make_connector()
+    connector.get_schemas.side_effect = lambda catalog: (
+        ["dbo"] if catalog == "cat_source" else ["for_schema_validation"]
+    )
+    connector.get_tables.side_effect = lambda catalog, schema: ["customers"]
+    validator = CatalogValidator(connector)
+
+    result = validator.compare_catalogs(
+        _request(schema_map={"dbo": "for_schema_validation"})
+    )
+
+    assert result.missing_schemas == []
+    assert result.extra_schemas == []
+    assert len(result.schemas) == 1
+    schema_result = result.schemas[0]
+    assert schema_result.schema_name == "for_schema_validation"
+    assert len(schema_result.tables) == 1
+    table = schema_result.tables[0]
+    assert table.schema_name == "for_schema_validation"
+    assert table.source_schema_name == "dbo"
+    assert table.status in (ValidationStatus.PASS, ValidationStatus.FAIL)
+
+
+def test_schema_map_to_nonexistent_target_schema_produces_clear_error():
+    """A schema_map entry naming a target schema that does NOT exist must
+    produce a visible FAIL/ERROR result naming the missing schema -
+    never a silent no-op."""
+    connector = _make_connector()
+    connector.get_schemas.side_effect = lambda catalog: (
+        ["dbo"] if catalog == "cat_source" else ["bronze"]
+    )
+    validator = CatalogValidator(connector)
+
+    result = validator.compare_catalogs(
+        _request(schema_map={"dbo": "does_not_exist_schema"})
+    )
+
+    error_schemas = [s for s in result.schemas if s.status == ValidationStatus.ERROR]
+    assert len(error_schemas) == 1
+    assert "does_not_exist_schema" in error_schemas[0].error
+    assert "does not exist" in error_schemas[0].error
+    assert result.status in (ValidationStatus.ERROR, ValidationStatus.FAIL)
+
+
+def test_no_map_configured_identical_name_discovery_unchanged():
+    """Regression guard: with no schema_map/table_map set (the default,
+    and today's only behavior), discovery must be completely unchanged -
+    identical-name intersection, same missing/extra reporting, same
+    per-table validation."""
+    connector = _make_connector()
+    connector.get_tables.side_effect = lambda catalog, schema: (
+        ["customers", "orders"] if catalog == "cat_source" else ["customers", "employees"]
+    )
+    validator = CatalogValidator(connector)
+
+    result = validator.compare_catalogs(_request())
+
+    schema_result = result.schemas[0]
+    assert schema_result.missing_tables == ["orders"]
+    assert schema_result.extra_tables == ["employees"]
+    assert [t.table for t in schema_result.tables] == ["customers"]
+    # No source/target name divergence -> the optional name fields stay unset.
+    assert schema_result.tables[0].source_table_name is None
+    assert schema_result.tables[0].source_schema_name is None
+
+
+def test_table_map_entry_matching_identical_name_is_not_duplicated():
+    """A table_map entry that happens to map a name to itself (or to an
+    already-identical-name pair) must not produce a duplicate table
+    result."""
+    connector = _make_connector()
+    connector.get_tables.return_value = ["customers"]
+    validator = CatalogValidator(connector)
+
+    result = validator.compare_catalogs(
+        _request(table_map={"customers": "customers"})
+    )
+
+    schema_result = result.schemas[0]
+    assert len(schema_result.tables) == 1

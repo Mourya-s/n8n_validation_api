@@ -420,20 +420,37 @@ def _run_databricks_validation(
     matching" for that level - CatalogValidator already performs the
     list-and-intersect discovery internally whenever request.schemas/
     tables is left unrestricted (None), so leaving the restriction off
-    IS the discovery trigger; there is no separate discovery step to call."""
+    IS the discovery trigger; there is no separate discovery step to call.
+
+    If the user explicitly named BOTH a source and target schema/table,
+    compare that exact pair directly - schema_map/table_map bypass
+    name-based matching entirely, so the two sides don't need to share a
+    name (a typo, a rename, different casing). schemas_restriction/
+    tables_restriction scope by the SOURCE-side name, matching
+    CatalogValidator._validate_schema/compare_catalogs' filtering
+    convention (mirrors _run_sql_validation's identical pattern below).
+    When names are identical (today's common case) schema_map/table_map
+    end up empty and behavior is unchanged."""
+    schema_map: Dict[str, str] = {}
     schemas_restriction = None
     if config.source_table.schema_name and config.target_table.schema_name:
-        schemas_restriction = [config.target_table.schema_name]
+        schemas_restriction = [config.source_table.schema_name]
+        if config.source_table.schema_name.lower() != config.target_table.schema_name.lower():
+            schema_map = {config.source_table.schema_name: config.target_table.schema_name}
 
+    table_map: Dict[str, str] = {}
     tables_restriction = None
     if config.source_table.table and config.target_table.table:
-        tables_restriction = [config.target_table.table]
+        tables_restriction = [config.source_table.table]
+        if config.source_table.table.lower() != config.target_table.table.lower():
+            table_map = {config.source_table.table: config.target_table.table}
 
     # A configured primary key only applies to the single named table
     # (not a catalog-wide sweep) - CatalogValidator looks it up by
     # "schema.table" first, falling back to a bare table name, so provide
     # both forms when a schema is known; falls back to row-number matching
-    # as before when unset.
+    # as before when unset. Keyed by the TARGET-side name, since that's
+    # what _lookup_primary_key resolves against.
     primary_keys: Dict[str, list] = {}
     if config.primary_key and config.target_table.table:
         primary_keys[config.target_table.table] = config.primary_key
@@ -447,7 +464,9 @@ def _run_databricks_validation(
         source_catalog=config.source_table.catalog or "",
         target_catalog=config.target_table.catalog or "",
         schemas=schemas_restriction,
+        schema_map=schema_map,
         tables=tables_restriction,
+        table_map=table_map,
         enabled_validations=set(config.validations),
         primary_keys=primary_keys,
         max_tier=max_tier,

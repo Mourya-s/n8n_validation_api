@@ -451,12 +451,38 @@ class CatalogValidationRequest(BaseModel):
         ),
     )
 
+    schema_map: Dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "Optional map of source-catalog schema name -> target-catalog "
+            "schema name, for when the user has explicitly named a source "
+            "and target schema that don't share the same name. An explicit "
+            "pair like this is compared directly, bypassing name-based "
+            "schema matching entirely (unlike `schemas`, which still "
+            "requires the name to appear in the intersection). Unmapped "
+            "schemas are matched by identical name as usual."
+        ),
+    )
+
     tables: Optional[List[str]] = Field(
         default=None,
         description=(
             "Restrict validation to these table names (applies within "
             "every validated schema). If omitted, all common tables are "
             "validated."
+        ),
+    )
+
+    table_map: Dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "Optional map of source-catalog table name -> target-catalog "
+            "table name, for when the user has explicitly named a source "
+            "and target table that don't share the same name - an explicit "
+            "pair like this is compared directly, bypassing name-based "
+            "table matching entirely (unlike `tables`, which still requires "
+            "the name to appear in the intersection). Unmapped tables are "
+            "matched by identical name as usual."
         ),
     )
 
@@ -834,6 +860,14 @@ class TableValidationResult(BaseModel):
     schema_name: str
     table: str
     status: ValidationStatus = ValidationStatus.SKIPPED
+
+    # Populated by CatalogValidator/AzureSqlValidator whenever the
+    # source-side schema/table name differs from the target-side name
+    # shown above (e.g. an explicit schema_map/table_map pair) - lets a
+    # future report enhancement show both names. schema_name/table above
+    # always reflect the TARGET-side name (the reporting convention).
+    source_schema_name: Optional[str] = None
+    source_table_name: Optional[str] = None
 
     exists_in_source: bool = True
     exists_in_target: bool = True
