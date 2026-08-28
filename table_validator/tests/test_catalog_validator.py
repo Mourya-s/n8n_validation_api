@@ -1473,6 +1473,36 @@ def test_table_map_validates_explicit_pair_with_different_names():
     connector.get_row_count.assert_called()
 
 
+def test_table_map_source_name_existing_identically_on_target_is_not_validated_twice():
+    """Real bug: the source table ('jd_example_data_2') coincidentally also
+    exists under that exact same name on the target side (an unrelated
+    leftover table), so compare_tables' plain intersection legitimately
+    finds an identical-name pair for it - in ADDITION to the table_map
+    entry pairing it with a different target ('jd_example_data_90'). The
+    mapping must supersede the identical-name match, not run alongside
+    it: one source table configured by the user must produce exactly one
+    validated table, against the mapped target only."""
+    connector = _make_connector()
+    connector.get_tables.side_effect = lambda catalog, schema: (
+        ["jd_example_data_2"] if catalog == "cat_source"
+        else ["jd_example_data_2", "jd_example_data_90"]
+    )
+    validator = CatalogValidator(connector)
+
+    result = validator.compare_catalogs(
+        _request(
+            tables=["jd_example_data_2"],
+            table_map={"jd_example_data_2": "jd_example_data_90"},
+        )
+    )
+
+    schema_result = result.schemas[0]
+    assert len(schema_result.tables) == 1
+    table = schema_result.tables[0]
+    assert table.table == "jd_example_data_90"
+    assert table.source_table_name == "jd_example_data_2"
+
+
 def test_table_map_to_nonexistent_target_table_produces_clear_error():
     """A table_map entry naming a target table that does NOT exist must
     produce a visible FAIL/ERROR with an informative message - never a

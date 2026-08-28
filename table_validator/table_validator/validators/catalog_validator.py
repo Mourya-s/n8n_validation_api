@@ -398,6 +398,18 @@ class CatalogValidator:
             if pair_key in existing_pairs_lower:
                 continue
 
+            # An explicit mapping for this source schema supersedes any
+            # identical-name pair already seeded for it (e.g. a
+            # coincidental same-named schema on both sides) - the user
+            # named exactly one target for this source schema, so it must
+            # be validated once, against that target, not once against
+            # its own identical-name match AND again against the mapped
+            # target.
+            common_pairs = [
+                (s, t) for s, t in common_pairs if s.lower() != actual_source.lower()
+            ]
+            existing_pairs_lower = {(s.lower(), t.lower()) for s, t in common_pairs}
+
             common_pairs.append((actual_source, actual_target))
             existing_pairs_lower.add(pair_key)
             missing_set.discard(actual_source)
@@ -585,6 +597,18 @@ class CatalogValidator:
             pair_key = (actual_source.lower(), actual_target.lower())
             if pair_key in existing_pairs_lower:
                 continue
+
+            # An explicit mapping for this source table supersedes any
+            # identical-name pair already seeded for it (e.g. a
+            # coincidental same-named table on both sides) - the user
+            # named exactly one target for this source table, so it must
+            # be validated once, against that target, not once against
+            # its own identical-name match AND again against the mapped
+            # target.
+            common_pairs = [
+                (s, t) for s, t in common_pairs if s.lower() != actual_source.lower()
+            ]
+            existing_pairs_lower = {(s.lower(), t.lower()) for s, t in common_pairs}
 
             common_pairs.append((actual_source, actual_target))
             existing_pairs_lower.add(pair_key)
