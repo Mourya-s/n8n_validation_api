@@ -528,15 +528,18 @@ class CatalogValidator:
         names within an already-resolved source_schema/target_schema
         pair).
         """
-        common, missing, extra = self.compare_tables(
-            request.source_catalog, request.target_catalog, source_schema
-        )
-
-        # NOTE: compare_tables() above assumes the same schema name on
-        # both sides. When source_schema != target_schema (a schema_map
-        # pair), that identical-name baseline is meaningless - re-derive
-        # it directly from each side's own schema.
-        if source_schema.lower() != target_schema.lower():
+        if source_schema.lower() == target_schema.lower():
+            common, missing, extra = self.compare_tables(
+                request.source_catalog, request.target_catalog, source_schema
+            )
+        else:
+            # compare_tables() assumes the same schema name on both
+            # sides - calling it here would query the TARGET catalog for
+            # a schema named after the SOURCE schema (a schema_map pair
+            # means these differ), which doesn't exist there and raises
+            # SCHEMA_NOT_FOUND instead of just being a wasted query.
+            # Derive the baseline directly from each side's own,
+            # correctly-named schema instead.
             try:
                 source_tables = set(self.databricks.get_tables(request.source_catalog, source_schema))
             except Exception:

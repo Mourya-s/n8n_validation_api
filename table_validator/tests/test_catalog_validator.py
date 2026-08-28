@@ -1574,6 +1574,48 @@ def test_schema_map_to_nonexistent_target_schema_produces_clear_error():
     assert result.status in (ValidationStatus.ERROR, ValidationStatus.FAIL)
 
 
+def test_schema_map_does_not_query_target_using_source_schema_name():
+    """Real bug: _resolve_table_pairs unconditionally called compare_tables
+    with the SOURCE schema name for both catalogs before checking whether
+    schema_map applied - querying the target catalog for a schema named
+    after the source schema, which doesn't exist there under a real
+    Databricks connector (raises SCHEMA_NOT_FOUND) rather than just being
+    a wasted no-op query. get_tables must only ever be called with each
+    catalog's own correctly-mapped schema name."""
+    connector = _make_connector()
+    connector.get_schemas.side_effect = lambda catalog: (
+        ["for_schema_validation"] if catalog == "cat_source" else ["bronze"]
+    )
+
+    def get_tables(catalog, schema):
+        if catalog == "cat_source" and schema == "for_schema_validation":
+            return ["bronze_fn_sku_add"]
+        if catalog == "cat_target" and schema == "bronze":
+            return ["bronze_fn_sku_add"]
+        raise RuntimeError(
+            f"Unable to list tables for '{catalog}.{schema}': SCHEMA_NOT_FOUND"
+        )
+
+    connector.get_tables.side_effect = get_tables
+    validator = CatalogValidator(connector)
+
+    result = validator.compare_catalogs(
+        _request(
+            schemas=["for_schema_validation"],
+            schema_map={"for_schema_validation": "bronze"},
+            tables=["bronze_fn_sku_add"],
+        )
+    )
+
+    assert result.status != ValidationStatus.ERROR
+    schema_result = result.schemas[0]
+    assert schema_result.schema_name == "bronze"
+    assert schema_result.status != ValidationStatus.ERROR
+    assert len(schema_result.tables) == 1
+    assert schema_result.tables[0].table == "bronze_fn_sku_add"
+    assert schema_result.tables[0].status in (ValidationStatus.PASS, ValidationStatus.FAIL)
+
+
 def test_no_map_configured_identical_name_discovery_unchanged():
     """Regression guard: with no schema_map/table_map set (the default,
     and today's only behavior), discovery must be completely unchanged -
