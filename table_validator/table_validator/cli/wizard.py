@@ -117,6 +117,52 @@ def _prompt_primary_key(existing: Optional[list]) -> Optional[list]:
     return [col.strip() for col in answer.split(",") if col.strip()]
 
 
+def _prompt_column_list(prompt_text: str, existing: Optional[list]) -> Optional[list]:
+    """Shared free-text parser for a comma-separated column list answer -
+    used by all three customization sub-options below. Returns None for
+    a blank answer (caller decides the actual default: None vs [])."""
+    default_str = ", ".join(existing) if existing else ""
+    answer = _ask(questionary.text(prompt_text, default=default_str))
+    if not answer:
+        return None
+    return [col.strip() for col in answer.split(",") if col.strip()]
+
+
+def _prompt_column_customization(config: ValidatorConfig) -> None:
+    """Optional column-level customization, asked right after the
+    primary key - only meaningful for the single named table
+    (primary_key's same scope). Skipped entirely (leaving any existing
+    only_columns/ignore_columns/ignore_datatype_columns untouched) unless
+    the user opts in, so a user who never touches this gets identical
+    behavior to before this feature existed."""
+    customize = questionary.confirm(
+        "Customize column validation? (skip specific columns, compare "
+        "only specific columns, or ignore datatype mismatches for "
+        "specific columns)",
+        default=False,
+    ).ask()
+
+    if not customize:
+        return
+
+    config.only_columns = _prompt_column_list(
+        "Compare ONLY these columns, comma-separated (leave blank to "
+        "compare every common column as usual):",
+        config.only_columns,
+    )
+    config.ignore_columns = _prompt_column_list(
+        "SKIP these columns entirely, comma-separated (leave blank to "
+        "skip none):",
+        config.ignore_columns,
+    ) or []
+    config.ignore_datatype_columns = _prompt_column_list(
+        "Ignore DATATYPE mismatches only for these columns, "
+        "comma-separated - their other checks (nullable, statistics, "
+        "row values) still run (leave blank to skip none):",
+        config.ignore_datatype_columns,
+    ) or []
+
+
 def _write_env_file(values: Dict[str, str], env_path: Optional[Path] = None) -> None:
     """
     Write secrets to env_path (default: ENV_PATH, resolved at call time)
@@ -394,8 +440,18 @@ def run_configure_wizard() -> None:
 
     if source_table_named and config.target_table.table:
         config.primary_key = _prompt_primary_key(config.primary_key)
+        # Column-level customization - same single-table scope as the
+        # primary key above (only_columns/ignore_columns/
+        # ignore_datatype_columns are only meaningful when there's one
+        # specific table to compare). Optional: a user who declines gets
+        # identical behavior to before this feature existed.
+        typer.echo("\n== Customize validation (optional) ==")
+        _prompt_column_customization(config)
     else:
         config.primary_key = None
+        config.only_columns = None
+        config.ignore_columns = []
+        config.ignore_datatype_columns = []
 
     # ------------------------------------------------------------------
     # 5. Validations to run

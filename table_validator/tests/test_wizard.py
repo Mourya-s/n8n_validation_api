@@ -335,6 +335,7 @@ def test_databricks_source_type_prompts_for_source_table(tmp_path, monkeypatch):
         "src_cat", "bronze", "customers",   # source table
         "tgt_cat", "silver", "customers",   # target table
         "",                                   # primary key (left blank)
+        False,                                # customize validation? (declined)
         [],                                  # validations
     ])
 
@@ -359,10 +360,98 @@ def test_databricks_source_type_prompts_for_primary_key_when_both_tables_named(
         "src_cat", "bronze", "customers",
         "tgt_cat", "silver", "customers",
         "id, region_id ",                    # primary key, comma-separated with stray spaces
+        False,                                # customize validation? (declined)
         [],
     ])
 
     assert config.primary_key == ["id", "region_id"]
+
+
+def test_databricks_wizard_declining_customization_leaves_defaults_untouched(
+    tmp_path, monkeypatch
+):
+    """Answering No to the customize-validation gate must leave
+    only_columns/ignore_columns/ignore_datatype_columns at their defaults
+    - a user who never opts in gets identical behavior to before this
+    feature existed."""
+    config = _run_wizard_with_answers(tmp_path, monkeypatch, [
+        "Databricks catalog -> Databricks catalog",
+        "https://adb-1.databricks.net", "/sql/1.0/warehouses/x", "tok",
+        "src_cat", "bronze", "customers",
+        "tgt_cat", "silver", "customers",
+        "",                                    # primary key (left blank)
+        False,                                 # customize validation? (declined)
+        [],
+    ])
+
+    assert config.only_columns is None
+    assert config.ignore_columns == []
+    assert config.ignore_datatype_columns == []
+
+
+def test_databricks_wizard_customize_populates_all_three_column_lists(
+    tmp_path, monkeypatch
+):
+    """Answering Yes to the customize-validation gate must ask for and
+    save all three column lists - only_columns (allowlist),
+    ignore_columns (denylist), ignore_datatype_columns."""
+    config = _run_wizard_with_answers(tmp_path, monkeypatch, [
+        "Databricks catalog -> Databricks catalog",
+        "https://adb-1.databricks.net", "/sql/1.0/warehouses/x", "tok",
+        "src_cat", "bronze", "customers",
+        "tgt_cat", "silver", "customers",
+        "id",                                  # primary key
+        True,                                  # customize validation? (accepted)
+        "id, name ",                            # only_columns, stray spaces
+        "updated_at",                           # ignore_columns
+        "legacy_flag, notes",                   # ignore_datatype_columns
+        [],
+    ])
+
+    assert config.only_columns == ["id", "name"]
+    assert config.ignore_columns == ["updated_at"]
+    assert config.ignore_datatype_columns == ["legacy_flag", "notes"]
+
+
+def test_databricks_wizard_customize_all_three_left_blank(tmp_path, monkeypatch):
+    """Opting into customization but leaving all three prompts blank must
+    resolve to only_columns=None, ignore_columns=[], ignore_datatype_columns=[] -
+    the same effective defaults as declining outright."""
+    config = _run_wizard_with_answers(tmp_path, monkeypatch, [
+        "Databricks catalog -> Databricks catalog",
+        "https://adb-1.databricks.net", "/sql/1.0/warehouses/x", "tok",
+        "src_cat", "bronze", "customers",
+        "tgt_cat", "silver", "customers",
+        "id",
+        True,                                  # customize validation? (accepted)
+        "",                                    # only_columns left blank
+        "",                                    # ignore_columns left blank
+        "",                                    # ignore_datatype_columns left blank
+        [],
+    ])
+
+    assert config.only_columns is None
+    assert config.ignore_columns == []
+    assert config.ignore_datatype_columns == []
+
+
+def test_databricks_wizard_catalog_wide_sweep_skips_customization_prompt(
+    tmp_path, monkeypatch
+):
+    """Catalog-wide sweep (no specific table named) must skip the
+    customize-validation gate entirely, same scope rule as primary_key -
+    a single column list can't apply to many different tables."""
+    config = _run_wizard_with_answers(tmp_path, monkeypatch, [
+        "Databricks catalog -> Databricks catalog",
+        "https://adb-1.databricks.net", "/sql/1.0/warehouses/x", "tok",
+        "src_cat", "", "",                    # source: catalog only
+        "tgt_cat", "", "",                    # target: catalog only
+        [],                                    # validations (no customize prompt in between)
+    ])
+
+    assert config.only_columns is None
+    assert config.ignore_columns == []
+    assert config.ignore_datatype_columns == []
 
 
 def test_databricks_wizard_skips_primary_key_prompt_for_catalog_wide_sweep(
@@ -457,6 +546,7 @@ def test_azure_sql_prompts_for_primary_key_when_table_named(tmp_path, monkeypatc
         "employees",                          # sql_source table
         "tgt_cat", "dbo", "employees_sample",  # target table
         "EmployeeID",                         # primary key
+        False,                                # customize validation? (declined)
         [],                                   # validations
     ])
 
@@ -498,6 +588,7 @@ def test_azure_blob_prompts_for_primary_key_when_blob_path_named(tmp_path, monke
         "validation/customers.csv",            # blob_path (explicit)
         "tgt_cat", "bronze", "customers",      # target table
         "id",                                  # primary key
+        False,                                 # customize validation? (declined)
         [],                                    # validations
     ])
 
