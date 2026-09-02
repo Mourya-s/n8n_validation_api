@@ -7,7 +7,7 @@ handled separately in Phase 4 and never appear on these models.
 from __future__ import annotations
 
 from enum import Enum
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from pydantic import BaseModel, Field
 
@@ -199,6 +199,22 @@ class ValidatorConfig(BaseModel):
             "SKIPPED rather than FAIL and never fails the table or aborts "
             "the schema stage, even for a cross-family type change that "
             "would otherwise be BLOCKING."
+        ),
+    )
+
+    column_map: Dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "Optional map of source-table column name -> target-table "
+            "column name, for an individual column renamed between "
+            "source and target (e.g. source has 'cust_id', target has "
+            "'customer_id'). Only meaningful for the single named table "
+            "in source_table/target_table, same scope as primary_key. "
+            "Set interactively by `configure`'s column-mapping picker, "
+            "or by hand. A column configured as both a primary key and "
+            "an entry here is rejected with a clear error at validate "
+            "time - a column used as the row-level join key must have "
+            "the identical name on both sides."
         ),
     )
 

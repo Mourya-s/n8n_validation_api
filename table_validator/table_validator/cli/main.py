@@ -10,7 +10,7 @@ from typing import Dict, Optional
 import typer
 
 from table_validator.auth.azure_auth import get_azure_credential
-from table_validator.auth.databricks_auth import get_databricks_token
+from table_validator.auth.databricks_auth import get_databricks_token, host_from_workspace_url
 from table_validator.cli.summary_table import (
     print_summary_table,
     summary_from_excel,
@@ -256,7 +256,7 @@ def validate(
 
     try:
         databricks = DatabricksConnector(
-            host=_host_from_workspace_url(config.databricks.workspace_url),
+            host=host_from_workspace_url(config.databricks.workspace_url),
             token=token,
             http_path=config.databricks.http_path,
         )
@@ -473,6 +473,7 @@ def _run_databricks_validation(
         only_columns=config.only_columns,
         ignore_columns=config.ignore_columns,
         ignore_datatype_columns=config.ignore_datatype_columns,
+        column_map=config.column_map,
     )
 
     partition_prompt = build_partition_prompt(yes=yes)
@@ -636,15 +637,6 @@ def _missing_config_fields(config: ValidatorConfig) -> list:
             missing.append("source_table.catalog")
 
     return missing
-
-
-def _host_from_workspace_url(workspace_url: Optional[str]) -> Optional[str]:
-    """DatabricksConnector wants a bare hostname; the wizard stores a full
-    https:// workspace URL, so strip the scheme and any trailing path."""
-    if not workspace_url:
-        return None
-    host = workspace_url.replace("https://", "").replace("http://", "")
-    return host.split("/")[0]
 
 
 def _open_in_default_app(path: Path) -> None:

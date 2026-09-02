@@ -1110,15 +1110,17 @@ def test_validate_no_primary_key_configured_uses_row_number_fallback(tmp_path: P
 def test_validate_databricks_wires_only_columns_ignore_columns_and_ignore_datatype(
     tmp_path: Path,
 ) -> None:
-    """config.only_columns/ignore_columns/ignore_datatype_columns must
-    reach CatalogValidationRequest unchanged - these were previously
-    silently dropped (the fields didn't exist on ValidatorConfig at all,
-    and _run_databricks_validation never passed them even once added)."""
+    """config.only_columns/ignore_columns/ignore_datatype_columns/
+    column_map must reach CatalogValidationRequest unchanged - these were
+    previously silently dropped (the fields didn't exist on
+    ValidatorConfig at all, and _run_databricks_validation never passed
+    them even once added)."""
     config_path = _full_config(tmp_path)
     config = load_config(config_path)
     config.only_columns = ["id", "name"]
     config.ignore_columns = ["updated_at"]
     config.ignore_datatype_columns = ["legacy_flag"]
+    config.column_map = {"cust_id": "customer_id"}
     save_config(config, config_path)
     output_path = tmp_path / "validation_report.xlsx"
 
@@ -1150,6 +1152,7 @@ def test_validate_databricks_wires_only_columns_ignore_columns_and_ignore_dataty
     assert request.only_columns == ["id", "name"]
     assert request.ignore_columns == ["updated_at"]
     assert request.ignore_datatype_columns == ["legacy_flag"]
+    assert request.column_map == {"cust_id": "customer_id"}
 
 
 def test_validate_mode_stats_stops_before_fingerprint_and_row_hash(tmp_path: Path) -> None:

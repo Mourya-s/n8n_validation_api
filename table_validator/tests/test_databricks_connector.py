@@ -480,3 +480,101 @@ def test_connect_explicit_arg_takes_priority_over_env_var(monkeypatch):
     connector.connect()
 
     assert captured["_retry_stop_after_attempts_duration"] == 600.0
+
+
+# ---------------------------------------------------------------------------
+# column_map (Phase 5): _changed_row_detail / get_row_detail_for_keys /
+# get_row_detail_for_row_numbers each side using its own column spelling,
+# reconciled back to the canonical (target) name.
+# ---------------------------------------------------------------------------
+def test_get_row_detail_for_keys_uses_target_value_columns_for_target_query(monkeypatch):
+    connector = _connector()
+    queries = []
+
+    def fake_execute(query):
+        queries.append(query)
+        first_from = query.strip().splitlines()[1].strip()
+        if first_from.startswith("FROM `cat_source`"):
+            return pd.DataFrame([{"id": 2, "cust_id": "111", "__row_hash": 111}])
+        if first_from.startswith("FROM `cat_target`"):
+            return pd.DataFrame([{"id": 2, "customer_id": "222", "__row_hash": 222}])
+        return pd.DataFrame()
+
+    monkeypatch.setattr(connector, "_execute_to_dataframe", fake_execute)
+
+    detail = connector.get_row_detail_for_keys(
+        source_catalog="cat_source",
+        target_catalog="cat_target",
+        schema="sch",
+        table="tbl",
+        key_column="id",
+        key_values=["2"],
+        value_columns=["cust_id"],
+        target_value_columns=["customer_id"],
+    )
+
+    assert len(detail) == 1
+    # Reconciled to the canonical (target) name.
+    assert detail[0]["mismatched_columns"] == ["customer_id"]
+    assert detail[0]["source_values"]["customer_id"] == "111"
+    assert detail[0]["target_values"]["customer_id"] == "222"
+
+    # The source-side query text uses the source spelling; target-side
+    # query text uses the target spelling. Match on the first FROM line
+    # (a later line's IN-subquery always references the source, by
+    # design - that subquery is just resolving which keys changed).
+    def _first_from(q):
+        return next(
+            line.strip() for line in q.strip().splitlines()
+            if line.strip().startswith("FROM `")
+        )
+
+    source_query = next(q for q in queries if _first_from(q).startswith("FROM `cat_source`"))
+    target_query = next(q for q in queries if _first_from(q).startswith("FROM `cat_target`"))
+    assert "`cust_id`" in source_query
+    assert "`customer_id`" not in source_query
+    assert "`customer_id`" in target_query
+    assert "`cust_id`" not in target_query
+
+
+def test_get_row_detail_for_row_numbers_uses_target_columns_for_target_query(monkeypatch):
+    connector = _connector()
+    queries = []
+
+    def fake_execute(query):
+        queries.append(query)
+        from_line = next(
+            line.strip() for line in query.strip().splitlines()
+            if line.strip().startswith("FROM `")
+        )
+        if from_line.startswith("FROM `cat_source`"):
+            return pd.DataFrame([{"row_number": 2, "cust_id": "111", "__row_hash": 111}])
+        if from_line.startswith("FROM `cat_target`"):
+            return pd.DataFrame([{"row_number": 2, "customer_id": "222", "__row_hash": 222}])
+        return pd.DataFrame()
+
+    monkeypatch.setattr(connector, "_execute_to_dataframe", fake_execute)
+
+    detail = connector.get_row_detail_for_row_numbers(
+        source_catalog="cat_source",
+        target_catalog="cat_target",
+        schema="sch",
+        table="tbl",
+        order_by_columns=["cust_id"],
+        row_numbers=[2],
+        value_columns=["cust_id"],
+        target_order_by_columns=["customer_id"],
+        target_value_columns=["customer_id"],
+    )
+
+    assert len(detail) == 1
+    assert detail[0]["mismatched_columns"] == ["customer_id"]
+    assert detail[0]["source_values"]["customer_id"] == "111"
+    assert detail[0]["target_values"]["customer_id"] == "222"
+
+    source_query = next(q for q in queries if "`cat_source`" in q)
+    target_query = next(q for q in queries if "`cat_target`" in q)
+    assert "`cust_id`" in source_query
+    assert "`customer_id`" not in source_query
+    assert "`customer_id`" in target_query
+    assert "`cust_id`" not in target_query

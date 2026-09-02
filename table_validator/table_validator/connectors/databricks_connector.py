@@ -878,6 +878,7 @@ class DatabricksConnector:
         key_values: Sequence[str],
         value_columns: Sequence[str],
         limit_samples: int = 500,
+        target_value_columns: Optional[Sequence[str]] = None,
     ) -> List[Dict[str, Any]]:
         """
         Tier 5: column-level diff for a bounded, already-known set of
@@ -887,6 +888,13 @@ class DatabricksConnector:
         column-by-column so callers can report exactly which column(s)
         differ per row. `key_values` are treated as opaque string literals
         (matching Tier 4's compare_row_hashes display-key convention).
+
+        `value_columns` is the SOURCE-side spelling; `target_value_columns`
+        (when a column_map applies), the positionally-aligned TARGET-side
+        spelling for the same columns. `key_column` itself is assumed
+        identical on both sides (a column used as a primary key must not
+        also be renamed via column_map - enforced at request-resolution
+        time, not here).
         """
         if not key_values:
             return []
@@ -909,6 +917,7 @@ class DatabricksConnector:
             value_columns=value_columns,
             changed_query=changed_query,
             limit_samples=limit_samples,
+            target_value_columns=target_value_columns,
         )
 
     def _changed_row_detail(
@@ -921,26 +930,42 @@ class DatabricksConnector:
         value_columns: Sequence[str],
         changed_query: str,
         limit_samples: int,
+        target_value_columns: Optional[Sequence[str]] = None,
     ) -> List[Dict[str, Any]]:
         """
         For a bounded sample of changed keys (from `changed_query`), fetch
         the full source and target rows (key + value columns) plus a
         whole-row hash for each side, so callers can report exactly which
         column(s) differ per row without ever collecting a full table.
+
+        `value_columns` is always the SOURCE-side column spelling.
+        `target_value_columns`, when given, is the positionally-aligned
+        TARGET-side spelling for the same columns (a column_map case) -
+        the source and target SQL each use their own side's names, and
+        the result is reconciled back to ONE canonical label per pair
+        (the target name, or the shared name when unmapped) so callers
+        never have to know which side a given result dict's keys came
+        from. When omitted, target_value_columns defaults to
+        value_columns (today's behavior, unchanged).
         """
-        value_idents = [self._quote_ident(c) for c in value_columns]
-        all_idents = key_idents + value_idents
-        select_list = ", ".join(all_idents)
-        value_concat = ", ".join(value_idents)
+        target_value_columns = list(target_value_columns or value_columns)
+        source_to_target = dict(zip(value_columns, target_value_columns))
+
+        source_value_idents = [self._quote_ident(c) for c in value_columns]
+        target_value_idents = [self._quote_ident(c) for c in target_value_columns]
+        source_select_list = ", ".join(key_idents + source_value_idents)
+        target_select_list = ", ".join(key_idents + target_value_idents)
+        source_concat = ", ".join(source_value_idents)
+        target_concat = ", ".join(target_value_idents)
 
         source_rows = self._execute_to_dataframe(f"""
-            SELECT {select_list}, hash({value_concat}) AS __row_hash
+            SELECT {source_select_list}, hash({source_concat}) AS __row_hash
             FROM {src}
             WHERE ({key_list}) IN (SELECT {key_list} FROM ({changed_query} LIMIT {int(limit_samples)}) __k)
         """).to_dict(orient="records")
 
         target_rows = self._execute_to_dataframe(f"""
-            SELECT {select_list}, hash({value_concat}) AS __row_hash
+            SELECT {target_select_list}, hash({target_concat}) AS __row_hash
             FROM {tgt}
             WHERE ({key_list}) IN (SELECT {key_list} FROM ({changed_query} LIMIT {int(limit_samples)}) __k)
         """).to_dict(orient="records")
@@ -956,9 +981,12 @@ class DatabricksConnector:
             if tgt_row is None:
                 continue
 
+            # Diff by pair, but report every result keyed by the
+            # canonical (target) column name - src_row/tgt_row are read
+            # using each side's own real column name.
             mismatched_columns = [
-                col for col in value_columns
-                if values_differ(src_row.get(col), tgt_row.get(col))
+                source_to_target[src_col] for src_col in value_columns
+                if values_differ(src_row.get(src_col), tgt_row.get(source_to_target[src_col]))
             ]
             if not mismatched_columns:
                 # SQL-side hash() flagged this row as changed, but our
@@ -967,14 +995,21 @@ class DatabricksConnector:
                 # that our value comparison normalizes away). Report the
                 # row anyway rather than silently dropping a row the
                 # mismatch count already accounts for.
-                mismatched_columns = list(value_columns)
+                mismatched_columns = list(target_value_columns)
 
             detail.append(
                 {
                     "key": {k: src_row.get(k) for k in key_columns},
                     "mismatched_columns": mismatched_columns,
-                    "source_values": {c: src_row.get(c) for c in mismatched_columns},
-                    "target_values": {c: tgt_row.get(c) for c in mismatched_columns},
+                    "source_values": {
+                        source_to_target[src_col]: src_row.get(src_col)
+                        for src_col in value_columns
+                        if source_to_target[src_col] in mismatched_columns
+                    },
+                    "target_values": {
+                        tgt_col: tgt_row.get(tgt_col)
+                        for tgt_col in mismatched_columns
+                    },
                     "source_row_hash": src_row.get("__row_hash"),
                     "target_row_hash": tgt_row.get("__row_hash"),
                 }
@@ -1131,6 +1166,8 @@ class DatabricksConnector:
         value_columns: Sequence[str],
         limit_samples: int = 500,
         bucket_predicate: Optional[Tuple[str, Any]] = None,
+        target_order_by_columns: Optional[Sequence[str]] = None,
+        target_value_columns: Optional[Sequence[str]] = None,
     ) -> List[Dict[str, Any]]:
         """
         Best-effort Tier 5 column-level diff for the ROW_NUMBER() fallback
@@ -1139,12 +1176,15 @@ class DatabricksConnector:
         used by get_row_hashes_by_row_number, filtered down to the given
         row numbers, then diffs the fetched rows column-by-column.
 
-        `order_by_columns` MUST be the exact same column list (same order)
-        passed to get_row_hashes_by_row_number for this table - that is
-        what keeps row numbers consistent between the hash-computation
-        pass (Tier 4) and this re-fetch (Tier 5). `value_columns` is
-        normally the same list too, since the row-number fallback has no
-        key to exclude.
+        `order_by_columns`/`value_columns` are the SOURCE-side spelling;
+        `target_order_by_columns`/`target_value_columns` (when a
+        column_map applies), the positionally-aligned TARGET-side
+        spelling for the same columns - each MUST be the exact same
+        per-side column list (same order) passed to
+        get_row_hashes_by_row_number for this table, which is what keeps
+        row numbers consistent between the hash-computation pass (Tier 4)
+        and this re-fetch (Tier 5). When omitted, the target lists default
+        to the source lists (today's behavior, unchanged).
 
         This is inherently best-effort, not a substitute for a real key:
         "row N" on the source and target are only the same logical record
@@ -1161,25 +1201,34 @@ class DatabricksConnector:
         Returns the same shape as _changed_row_detail: one dict per
         row with "key" (here always {"row_number": N}),
         "mismatched_columns", "source_values", "target_values",
-        "source_row_hash", "target_row_hash".
+        "source_row_hash", "target_row_hash" - all keyed/labeled by the
+        canonical (target) column name.
         """
         if not row_numbers:
             return []
 
+        target_order_by_columns = list(target_order_by_columns or order_by_columns)
+        target_value_columns = list(target_value_columns or value_columns)
+        source_to_target = dict(zip(value_columns, target_value_columns))
+
         src = self._qualify(source_catalog, schema, table)
         tgt = self._qualify(target_catalog, schema, table)
-        order_by = ", ".join(self._quote_ident(c) for c in order_by_columns)
-        value_idents = [self._quote_ident(c) for c in value_columns]
-        select_list = ", ".join(value_idents)
+        source_order_by = ", ".join(self._quote_ident(c) for c in order_by_columns)
+        target_order_by = ", ".join(self._quote_ident(c) for c in target_order_by_columns)
+        source_value_idents = [self._quote_ident(c) for c in value_columns]
+        target_value_idents = [self._quote_ident(c) for c in target_value_columns]
+        source_select_list = ", ".join(source_value_idents)
+        target_select_list = ", ".join(target_value_idents)
         where_clause = self._bucket_where_clause(bucket_predicate)
-        row_hash_expr = self._row_hash_expr(value_columns)
+        source_row_hash_expr = self._row_hash_expr(value_columns)
+        target_row_hash_expr = self._row_hash_expr(target_value_columns)
 
         # row_numbers are Python ints derived from our own prior
         # ROW_NUMBER() output (never user input) - safe to inline.
         unique_row_numbers = sorted(set(int(n) for n in row_numbers))[: int(limit_samples)]
         row_numbers_csv = ", ".join(str(n) for n in unique_row_numbers)
 
-        def _numbered_query(fqtn: str) -> str:
+        def _numbered_query(fqtn: str, order_by: str, select_list: str, row_hash_expr: str) -> str:
             return f"""
                 SELECT row_number, {select_list}, {row_hash_expr} AS __row_hash
                 FROM (
@@ -1194,10 +1243,10 @@ class DatabricksConnector:
 
         try:
             source_rows = self._execute_to_dataframe(
-                _numbered_query(src)
+                _numbered_query(src, source_order_by, source_select_list, source_row_hash_expr)
             ).to_dict(orient="records")
             target_rows = self._execute_to_dataframe(
-                _numbered_query(tgt)
+                _numbered_query(tgt, target_order_by, target_select_list, target_row_hash_expr)
             ).to_dict(orient="records")
         except Exception as exc:
             logger.exception(
@@ -1216,18 +1265,25 @@ class DatabricksConnector:
                 continue
 
             mismatched_columns = [
-                col for col in value_columns
-                if values_differ(src_row.get(col), tgt_row.get(col))
+                source_to_target[src_col] for src_col in value_columns
+                if values_differ(src_row.get(src_col), tgt_row.get(source_to_target[src_col]))
             ]
             if not mismatched_columns:
-                mismatched_columns = list(value_columns)
+                mismatched_columns = list(target_value_columns)
 
             detail.append(
                 {
                     "key": {"row_number": src_row["row_number"]},
                     "mismatched_columns": mismatched_columns,
-                    "source_values": {c: src_row.get(c) for c in mismatched_columns},
-                    "target_values": {c: tgt_row.get(c) for c in mismatched_columns},
+                    "source_values": {
+                        source_to_target[src_col]: src_row.get(src_col)
+                        for src_col in value_columns
+                        if source_to_target[src_col] in mismatched_columns
+                    },
+                    "target_values": {
+                        tgt_col: tgt_row.get(tgt_col)
+                        for tgt_col in mismatched_columns
+                    },
                     "source_row_hash": src_row.get("__row_hash"),
                     "target_row_hash": tgt_row.get("__row_hash"),
                 }

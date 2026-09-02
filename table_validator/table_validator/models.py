@@ -517,6 +517,30 @@ class CatalogValidationRequest(BaseModel):
         ),
     )
 
+    column_map: Dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "Optional map of source-table column name -> target-table "
+            "column name, for when an individual column was renamed "
+            "between source and target (e.g. source has 'cust_id', "
+            "target has 'customer_id'). An explicit pair like this is "
+            "treated as fully equivalent through the entire pipeline - "
+            "schema/type/nullable checks, null/distinct/min-max "
+            "statistics, whole-table fingerprint, row-hash diff, and "
+            "column-level mismatch detail - bypassing name-based column "
+            "matching entirely for that pair (unlike ignore_columns/"
+            "only_columns, which still require the name to appear in the "
+            "intersection). Unmapped columns are matched by identical "
+            "name as usual. Resolved before only_columns/ignore_columns/"
+            "ignore_datatype_columns apply, so those three act on the "
+            "resolved/canonical (target-side) name. A mapped name that "
+            "doesn't actually exist on either side produces a clear "
+            "error rather than a silent no-op. Known limitation: a "
+            "column configured as a primary key, or used as a Tier 3 "
+            "partition/bucket column, must not also appear here."
+        ),
+    )
+
     case_sensitive_columns: bool = Field(
         default=False,
         description="Case-sensitive column name comparison.",
@@ -758,6 +782,12 @@ class ColumnValidationResult(BaseModel):
     column: str
     status: ValidationStatus
 
+    # Populated only when column_map actually renamed this column (source
+    # name differs from the target/canonical name shown above) - mirrors
+    # TableValidationResult.source_table_name's "only set when it
+    # differs" convention.
+    source_column: Optional[str] = None
+
     source_data_type: Optional[str] = None
     target_data_type: Optional[str] = None
     data_type_status: Optional[ValidationStatus] = None
@@ -798,6 +828,11 @@ class RowMismatchDetail(BaseModel):
 
     primary_key: Dict[str, Any] = Field(default_factory=dict)
     mismatch_column: str
+
+    # Populated only when column_map actually renamed this column -
+    # mismatch_column stays the canonical/target-side name (existing
+    # report rendering, existing tests, unaffected).
+    source_mismatch_column: Optional[str] = None
 
     source_value: Optional[Any] = None
     target_value: Optional[Any] = None

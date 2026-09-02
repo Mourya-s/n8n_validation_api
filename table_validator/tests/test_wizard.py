@@ -295,12 +295,27 @@ def test_all_option_combined_with_individual_choice_has_no_duplicates():
 # source_type branching: each of the three choices must drive the wizard
 # through its own set of prompts and persist the right config sections.
 # ---------------------------------------------------------------------------
-def _run_wizard_with_answers(tmp_path, monkeypatch, answers_list):
+def _run_wizard_with_answers(
+    tmp_path, monkeypatch, answers_list, databricks_token="", databricks_connector=None,
+):
     """Helper: run run_configure_wizard() with every questionary prompt
     type patched to pop answers off answers_list in order, against an
-    isolated config/env path. Returns the reloaded ValidatorConfig."""
+    isolated config/env path. Returns the reloaded ValidatorConfig.
+
+    databricks_token/databricks_connector default to "" (falsy) / a
+    MagicMock, patched into the auth/databricks_auth and
+    databricks_connector modules that _prompt_column_mapping imports
+    LOCALLY (inside the function body, not at module import time) - a
+    falsy token makes that step's live-connection attempt take its
+    graceful-fallback early return deterministically, so tests that
+    don't care about column-mapping never touch a real network call or
+    need an extra stubbed answer. Tests that DO want to exercise the
+    live-picker path pass a truthy token and a MagicMock connector whose
+    get_table_schema is configured with the desired column lists."""
     import table_validator.config.manager as manager_mod
     import table_validator.cli.wizard as wizard_mod
+    import table_validator.auth.databricks_auth as databricks_auth_mod
+    import table_validator.connectors.databricks_connector as databricks_connector_mod
 
     config_path = tmp_path / "config.yaml"
     env_path = tmp_path / ".env"
@@ -320,6 +335,11 @@ def _run_wizard_with_answers(tmp_path, monkeypatch, answers_list):
     monkeypatch.setattr(wizard_mod.questionary, "password", fake_prompt)
     monkeypatch.setattr(wizard_mod.questionary, "checkbox", fake_prompt)
     monkeypatch.setattr(wizard_mod.questionary, "select", fake_prompt)
+    monkeypatch.setattr(databricks_auth_mod, "get_databricks_token", lambda *a, **k: databricks_token)
+    monkeypatch.setattr(
+        databricks_connector_mod, "DatabricksConnector",
+        MagicMock(return_value=databricks_connector or MagicMock()),
+    )
 
     wizard_mod.run_configure_wizard()
 
@@ -593,3 +613,197 @@ def test_azure_blob_prompts_for_primary_key_when_blob_path_named(tmp_path, monke
     ])
 
     assert config.primary_key == ["id"]
+
+
+# ---------------------------------------------------------------------------
+# _prompt_column_mapping: live column-name-mapping picker (Databricks-to-
+# Databricks only), with a graceful fallback if the live connection fails.
+# ---------------------------------------------------------------------------
+def _schema_df(columns):
+    """columns: list of names (data_type/is_nullable irrelevant here)."""
+    import pandas as pd
+    return pd.DataFrame([
+        {"column_name": c, "data_type": "string", "is_nullable": True, "ordinal_position": i + 1}
+        for i, c in enumerate(columns)
+    ])
+
+
+def test_column_mapping_skipped_when_no_token_available(tmp_path, monkeypatch):
+    """Default _run_wizard_with_answers behavior (no token) - the
+    column-mapping step must skip silently, asking nothing at all, and
+    leave column_map empty."""
+    config = _run_wizard_with_answers(tmp_path, monkeypatch, [
+        "Databricks catalog -> Databricks catalog",
+        "https://adb-1.databricks.net", "/sql/1.0/warehouses/x", "tok",
+        "src_cat", "bronze", "customers",
+        "tgt_cat", "silver", "customers",
+        "id",
+        False,  # customize validation? (declined)
+        [],
+    ])
+
+    assert config.column_map == {}
+
+
+def test_column_mapping_live_connection_success_populates_map(tmp_path, monkeypatch):
+    """A live connection succeeds, one source column has no identical-
+    name match, and the user picks a target column for it."""
+    connector = MagicMock()
+    connector.get_table_schema.side_effect = lambda catalog, schema, table: (
+        _schema_df(["id", "cust_id"]) if catalog == "src_cat"
+        else _schema_df(["id", "customer_id"])
+    )
+    config = _run_wizard_with_answers(
+        tmp_path, monkeypatch,
+        [
+            "Databricks catalog -> Databricks catalog",
+            "https://adb-1.databricks.net", "/sql/1.0/warehouses/x", "tok",
+            "src_cat", "bronze", "customers",
+            "tgt_cat", "silver", "customers",
+            "id",
+            False,           # customize validation? (declined)
+            "customer_id",   # column mapping: cust_id -> customer_id
+            [],
+        ],
+        databricks_token="dapi_fake",
+        databricks_connector=connector,
+    )
+
+    assert config.column_map == {"cust_id": "customer_id"}
+
+
+def test_column_mapping_live_connection_failure_skips_gracefully(tmp_path, monkeypatch):
+    """A truthy token but a connection/query failure must still degrade
+    to silently skipping, never crashing configure."""
+    connector = MagicMock()
+    connector.get_table_schema.side_effect = RuntimeError("connection refused")
+
+    config = _run_wizard_with_answers(
+        tmp_path, monkeypatch,
+        [
+            "Databricks catalog -> Databricks catalog",
+            "https://adb-1.databricks.net", "/sql/1.0/warehouses/x", "tok",
+            "src_cat", "bronze", "customers",
+            "tgt_cat", "silver", "customers",
+            "id",
+            False,  # customize validation? (declined)
+            [],
+        ],
+        databricks_token="dapi_fake",
+        databricks_connector=connector,
+    )
+
+    assert config.column_map == {}
+
+
+def test_column_mapping_only_asks_about_unmatched_source_columns(tmp_path, monkeypatch):
+    """Two of three source columns already have an identical-name target
+    match - only the genuinely unmatched one should trigger a select
+    prompt. Proven by the answer sequence needing exactly ONE
+    column-mapping answer ("customer_id") despite three source columns
+    existing - if 'id'/'name' were also prompted, the answers iterator
+    would be exhausted early and the wizard would raise StopIteration."""
+    connector = MagicMock()
+    connector.get_table_schema.side_effect = lambda catalog, schema, table: (
+        _schema_df(["id", "name", "cust_id"]) if catalog == "src_cat"
+        else _schema_df(["id", "name", "customer_id"])
+    )
+    config = _run_wizard_with_answers(
+        tmp_path, monkeypatch,
+        [
+            "Databricks catalog -> Databricks catalog",
+            "https://adb-1.databricks.net", "/sql/1.0/warehouses/x", "tok",
+            "src_cat", "bronze", "customers",
+            "tgt_cat", "silver", "customers",
+            "id",
+            False,
+            "customer_id",  # only ONE column-mapping answer, for cust_id
+            [],
+        ],
+        databricks_token="dapi_fake",
+        databricks_connector=connector,
+    )
+
+    assert config.column_map == {"cust_id": "customer_id"}
+
+
+def test_column_mapping_skip_leaves_column_unmapped(tmp_path, monkeypatch):
+    """Answering the skip label for an unmatched column must leave it
+    absent from column_map entirely."""
+    connector = MagicMock()
+    connector.get_table_schema.side_effect = lambda catalog, schema, table: (
+        _schema_df(["id", "cust_id"]) if catalog == "src_cat"
+        else _schema_df(["id", "customer_id"])
+    )
+    config = _run_wizard_with_answers(
+        tmp_path, monkeypatch,
+        [
+            "Databricks catalog -> Databricks catalog",
+            "https://adb-1.databricks.net", "/sql/1.0/warehouses/x", "tok",
+            "src_cat", "bronze", "customers",
+            "tgt_cat", "silver", "customers",
+            "id",
+            False,
+            "(skip this column)",
+            [],
+        ],
+        databricks_token="dapi_fake",
+        databricks_connector=connector,
+    )
+
+    assert config.column_map == {}
+
+
+def test_column_mapping_no_unmatched_columns_asks_nothing(tmp_path, monkeypatch):
+    """Every source column already has an identical-name target match -
+    the step must ask nothing at all (no extra answer consumed)."""
+    connector = MagicMock()
+    connector.get_table_schema.side_effect = lambda catalog, schema, table: _schema_df(["id", "name"])
+
+    config = _run_wizard_with_answers(
+        tmp_path, monkeypatch,
+        [
+            "Databricks catalog -> Databricks catalog",
+            "https://adb-1.databricks.net", "/sql/1.0/warehouses/x", "tok",
+            "src_cat", "bronze", "customers",
+            "tgt_cat", "silver", "customers",
+            "id",
+            False,
+            # no column-mapping answer - none should be consumed
+            [],
+        ],
+        databricks_token="dapi_fake",
+        databricks_connector=connector,
+    )
+
+    assert config.column_map == {}
+
+
+def test_column_mapping_skipped_for_azure_sql_source_type(tmp_path, monkeypatch):
+    """Non-Databricks source types must never attempt the live
+    connection or prompt at all, even with a valid token/connector."""
+    connector = MagicMock()
+    connector.get_table_schema.side_effect = AssertionError("should never be called")
+
+    config = _run_wizard_with_answers(
+        tmp_path, monkeypatch,
+        [
+            "Azure SQL Database -> Databricks catalog",
+            "https://adb-1.databricks.net", "/sql/1.0/warehouses/x", "tok",
+            None, None,
+            "myserver.database.windows.net",
+            "mydb",
+            "sqluser",
+            "sqlpass",
+            "dbo",
+            "employees",
+            "tgt_cat", "dbo", "employees_sample",
+            "EmployeeID",
+            False,  # customize validation? (declined)
+            [],
+        ],
+        databricks_token="dapi_fake",
+        databricks_connector=connector,
+    )
+
+    assert config.column_map == {}

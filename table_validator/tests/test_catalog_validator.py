@@ -615,17 +615,27 @@ def test_duplicate_key_detected_in_row_hash_comparison():
 # Tier 3: partition candidate selection (pure logic, no mocks needed).
 # ---------------------------------------------------------------------------
 def test_partition_candidates_excludes_primary_key_and_sorts_alphabetically():
-    candidates = CatalogValidator._partition_candidates(
-        ["id", "region", "amount", "created_at"], key_columns=["id"],
-    )
+    pairs = [(c, c) for c in ("id", "region", "amount", "created_at")]
+    candidates = CatalogValidator._partition_candidates(pairs, key_columns=["id"])
     assert candidates == ["amount", "created_at", "region"]
 
 
 def test_partition_candidates_with_no_key_configured_offers_all_columns():
-    candidates = CatalogValidator._partition_candidates(
-        ["id", "region"], key_columns=None,
-    )
+    pairs = [(c, c) for c in ("id", "region")]
+    candidates = CatalogValidator._partition_candidates(pairs, key_columns=None)
     assert candidates == ["id", "region"]
+
+
+def test_partition_candidates_excludes_renamed_column_from_candidacy():
+    """A column whose name differs between source and target (a
+    column_map pair) must never be offered as a bucket-column candidate -
+    get_table_fingerprint_by_bucket queries both catalogs with one shared
+    bucket_column name, which would fail on the side using the other
+    spelling."""
+    pairs = [("id", "id"), ("cust_id", "customer_id"), ("region", "region")]
+    candidates = CatalogValidator._partition_candidates(pairs, key_columns=["id"])
+    assert candidates == ["region"]
+    assert "customer_id" not in candidates
 
 
 # ---------------------------------------------------------------------------
@@ -1763,3 +1773,586 @@ def test_ignore_datatype_columns_does_not_affect_unlisted_columns():
     table = result.schemas[0].tables[0]
     assert table.schema_blocking is True
     assert table.tier_reached == ValidationTier.SCHEMA_BLOCKED
+
+
+# ---------------------------------------------------------------------------
+# column_map (Phase 1: schema-level recognition only - Tiers 1-5 still
+# receive the resolved pairs' flat target-side name list unchanged, full
+# statistics/fingerprint/row-hash/column-diff support lands in later
+# phases of this feature)
+# ---------------------------------------------------------------------------
+def test_column_map_treats_renamed_pair_as_common_column():
+    """A column_map entry ('cust_id' -> 'customer_id') must be recognized
+    as one common column even though compare_columns' plain name
+    intersection would classify it as missing (source) + extra (target)."""
+    connector = _make_connector()
+    connector.get_table_schema.side_effect = lambda catalog, schema, table: (
+        _schema_df([("id", "int", False), ("cust_id", "int", False), ("name", "string", True)])
+        if catalog == "cat_source"
+        else _schema_df([("id", "int", False), ("customer_id", "int", False), ("name", "string", True)])
+    )
+    connector.get_column_statistics.return_value = {
+        "id": {"null_count": 0, "distinct_count": 100, "min": None, "max": None},
+        "cust_id": {"null_count": 0, "distinct_count": 100, "min": None, "max": None},
+        "customer_id": {"null_count": 0, "distinct_count": 100, "min": None, "max": None},
+        "name": {"null_count": 2, "distinct_count": 95, "min": None, "max": None},
+    }
+    validator = CatalogValidator(connector)
+
+    result = validator.compare_catalogs(
+        _request(column_map={"cust_id": "customer_id"})
+    )
+
+    table = result.schemas[0].tables[0]
+    assert table.missing_columns == []
+    assert table.extra_columns == []
+    assert table.schema_blocking is not True
+    mapped = next(c for c in table.columns if c.column == "customer_id")
+    assert mapped.source_column == "cust_id"
+    # An unmapped, identically-named column stays unmarked.
+    unmapped = next(c for c in table.columns if c.column == "id")
+    assert unmapped.source_column is None
+
+
+def test_column_map_to_nonexistent_source_column_produces_clear_error():
+    connector = _make_connector()
+    validator = CatalogValidator(connector)
+
+    result = validator.compare_catalogs(
+        _request(column_map={"does_not_exist_column": "name"})
+    )
+
+    table = result.schemas[0].tables[0]
+    assert table.status == ValidationStatus.ERROR
+    assert "does_not_exist_column" in table.error
+    assert "does not exist" in table.error
+
+
+def test_column_map_to_nonexistent_target_column_produces_clear_error():
+    connector = _make_connector()
+    validator = CatalogValidator(connector)
+
+    result = validator.compare_catalogs(
+        _request(column_map={"id": "does_not_exist_column"})
+    )
+
+    table = result.schemas[0].tables[0]
+    assert table.status == ValidationStatus.ERROR
+    assert "does_not_exist_column" in table.error
+    assert "does not exist" in table.error
+
+
+def test_column_map_precedence_ignore_columns_wins_over_mapped_pair():
+    """ignore_columns must still win over a column_map entry, checked
+    against either side's spelling."""
+    connector = _make_connector()
+    connector.get_table_schema.side_effect = lambda catalog, schema, table: (
+        _schema_df([("id", "int", False), ("cust_id", "int", False)])
+        if catalog == "cat_source"
+        else _schema_df([("id", "int", False), ("customer_id", "int", False)])
+    )
+    validator = CatalogValidator(connector)
+
+    result = validator.compare_catalogs(
+        _request(
+            column_map={"cust_id": "customer_id"},
+            ignore_columns=["customer_id"],
+        )
+    )
+
+    table = result.schemas[0].tables[0]
+    assert "customer_id" not in [c.column for c in table.columns]
+    # id is the only surviving common column - schema no longer blocks.
+    assert [c.column for c in table.columns] == ["id"]
+
+
+def test_column_map_precedence_only_columns_filters_by_canonical_name():
+    """only_columns filters by the resolved/canonical (target-side) name,
+    so a mapped column must be named by its NEW spelling to survive the
+    allowlist."""
+    connector = _make_connector()
+    connector.get_table_schema.side_effect = lambda catalog, schema, table: (
+        _schema_df([("id", "int", False), ("cust_id", "int", False), ("name", "string", True)])
+        if catalog == "cat_source"
+        else _schema_df([("id", "int", False), ("customer_id", "int", False), ("name", "string", True)])
+    )
+    connector.get_column_statistics.return_value = {
+        "id": {"null_count": 0, "distinct_count": 100, "min": None, "max": None},
+        "customer_id": {"null_count": 0, "distinct_count": 100, "min": None, "max": None},
+    }
+    validator = CatalogValidator(connector)
+
+    result = validator.compare_catalogs(
+        _request(
+            column_map={"cust_id": "customer_id"},
+            only_columns=["id", "customer_id"],
+        )
+    )
+
+    table = result.schemas[0].tables[0]
+    assert sorted(c.column for c in table.columns) == ["customer_id", "id"]
+
+
+def test_column_map_precedence_ignore_datatype_checked_both_spellings():
+    """ignore_datatype_columns must be honored whichever spelling the
+    user typed - the mapped-from (source) name or the canonical
+    (target) name."""
+    connector = _make_connector()
+    connector.get_table_schema.side_effect = lambda catalog, schema, table: (
+        _schema_df([("id", "int", False), ("legacy_flag", "string", True)])
+        if catalog == "cat_source"
+        else _schema_df([("id", "int", False), ("new_flag", "int", True)])
+    )
+    connector.get_column_statistics.return_value = {
+        "id": {"null_count": 0, "distinct_count": 100, "min": None, "max": None},
+        "new_flag": {"null_count": 0, "distinct_count": 2, "min": None, "max": None},
+    }
+    validator = CatalogValidator(connector)
+
+    result = validator.compare_catalogs(
+        _request(
+            column_map={"legacy_flag": "new_flag"},
+            ignore_datatype_columns=["legacy_flag"],  # typed the OLD spelling
+        )
+    )
+
+    table = result.schemas[0].tables[0]
+    assert table.schema_blocking is not True
+    mapped = next(c for c in table.columns if c.column == "new_flag")
+    assert mapped.data_type_status == ValidationStatus.SKIPPED
+
+
+def test_column_map_empty_is_identical_to_today_full_pipeline():
+    """Regression guard: with column_map unset (the default), behavior
+    must be completely unchanged from before this feature existed."""
+    connector = _make_connector()
+    validator = CatalogValidator(connector)
+
+    result = validator.compare_catalogs(_request())
+
+    table = result.schemas[0].tables[0]
+    assert table.status in (ValidationStatus.PASS, ValidationStatus.FAIL)
+    for col in table.columns:
+        assert col.source_column is None
+
+
+# ---------------------------------------------------------------------------
+# column_map (Phase 2: Tier 1 statistics use per-side, positionally
+# aligned column-name lists instead of one shared list)
+# ---------------------------------------------------------------------------
+def test_column_map_statistics_queried_with_each_sides_own_column_names():
+    """get_column_statistics must be called with the SOURCE-side name for
+    the source-catalog call and the TARGET-side name for the
+    target-catalog call - never one shared list reused for both."""
+    connector = _make_connector()
+    connector.get_table_schema.side_effect = lambda catalog, schema, table: (
+        _schema_df([("id", "int", False), ("cust_id", "int", False)])
+        if catalog == "cat_source"
+        else _schema_df([("id", "int", False), ("customer_id", "int", False)])
+    )
+    calls = []
+
+    def fake_get_column_statistics(catalog, schema, table, columns, min_max_columns):
+        calls.append((catalog, list(columns)))
+        return {c: {"null_count": 0, "distinct_count": 10, "min": None, "max": None} for c in columns}
+
+    connector.get_column_statistics.side_effect = fake_get_column_statistics
+    validator = CatalogValidator(connector)
+
+    validator.compare_catalogs(_request(column_map={"cust_id": "customer_id"}))
+
+    source_call = next(c for c in calls if c[0] == "cat_source")
+    target_call = next(c for c in calls if c[0] == "cat_target")
+    assert "cust_id" in source_call[1]
+    assert "customer_id" not in source_call[1]
+    assert "customer_id" in target_call[1]
+    assert "cust_id" not in target_call[1]
+
+
+def test_column_map_statistics_merge_by_position_not_shared_key():
+    """The merged ColumnValidationResult for a mapped pair must combine
+    that pair's OWN source-side and target-side stats - not accidentally
+    read another column's stats through a shared-string-key collision."""
+    connector = _make_connector()
+    connector.get_table_schema.side_effect = lambda catalog, schema, table: (
+        _schema_df([("id", "int", False), ("cust_id", "int", False)])
+        if catalog == "cat_source"
+        else _schema_df([("id", "int", False), ("customer_id", "int", False)])
+    )
+    connector.get_column_statistics.side_effect = lambda catalog, schema, table, columns, min_max_columns: (
+        {
+            "id": {"null_count": 0, "distinct_count": 10, "min": None, "max": None},
+            "cust_id": {"null_count": 3, "distinct_count": 7, "min": None, "max": None},
+        }
+        if catalog == "cat_source"
+        else {
+            "id": {"null_count": 0, "distinct_count": 10, "min": None, "max": None},
+            "customer_id": {"null_count": 3, "distinct_count": 7, "min": None, "max": None},
+        }
+    )
+    validator = CatalogValidator(connector)
+
+    result = validator.compare_catalogs(
+        _request(column_map={"cust_id": "customer_id"})
+    )
+
+    table = result.schemas[0].tables[0]
+    mapped = next(c for c in table.columns if c.column == "customer_id")
+    assert mapped.source_null_count == 3
+    assert mapped.target_null_count == 3
+    assert mapped.null_count_status == ValidationStatus.PASS
+    assert mapped.source_column == "cust_id"
+
+
+def test_column_map_statistics_positional_alignment_survives_alphabetical_reorder():
+    """Critical correctness case: the renamed column's new spelling sorts
+    to a DIFFERENT alphabetical position than its old spelling relative
+    to a sibling column - min_max_pairs/common_pairs must stay
+    positionally aligned by shared pair order, not by independently
+    re-sorting each side's own names."""
+    connector = _make_connector()
+    # Source: 'amount' < 'cust_id' alphabetically.
+    # Target: 'amount' > 'z_customer_identifier' alphabetically - if
+    # either side were re-sorted independently by its own spelling, the
+    # merge would misalign 'amount' with the wrong stats.
+    connector.get_table_schema.side_effect = lambda catalog, schema, table: (
+        _schema_df([("amount", "int", False), ("cust_id", "int", False)])
+        if catalog == "cat_source"
+        else _schema_df([("amount", "int", False), ("z_customer_identifier", "int", False)])
+    )
+    connector.get_column_statistics.side_effect = lambda catalog, schema, table, columns, min_max_columns: (
+        {
+            "amount": {"null_count": 1, "distinct_count": 50, "min": 0, "max": 100},
+            "cust_id": {"null_count": 9, "distinct_count": 5, "min": 1, "max": 5},
+        }
+        if catalog == "cat_source"
+        else {
+            "amount": {"null_count": 1, "distinct_count": 50, "min": 0, "max": 100},
+            "z_customer_identifier": {"null_count": 9, "distinct_count": 5, "min": 1, "max": 5},
+        }
+    )
+    connector.is_min_max_eligible.return_value = True
+    validator = CatalogValidator(connector)
+
+    result = validator.compare_catalogs(
+        _request(column_map={"cust_id": "z_customer_identifier"})
+    )
+
+    table = result.schemas[0].tables[0]
+    amount = next(c for c in table.columns if c.column == "amount")
+    mapped = next(c for c in table.columns if c.column == "z_customer_identifier")
+
+    assert amount.source_null_count == 1 and amount.target_null_count == 1
+    assert amount.source_min == 0 and amount.target_min == 0
+    assert mapped.source_null_count == 9 and mapped.target_null_count == 9
+    assert mapped.source_min == 1 and mapped.target_min == 1
+    # No cross-contamination between the two columns' stats.
+    assert amount.null_count_status == ValidationStatus.PASS
+    assert mapped.null_count_status == ValidationStatus.PASS
+
+
+def test_column_map_min_max_eligibility_uses_source_side_data_type():
+    """min_max eligibility is determined from the SOURCE column's data
+    type (as today, unchanged) - confirm this still works correctly when
+    the source and target spellings differ."""
+    connector = _make_connector()
+    connector.get_table_schema.side_effect = lambda catalog, schema, table: (
+        _schema_df([("id", "int", False), ("cust_id", "int", False)])
+        if catalog == "cat_source"
+        else _schema_df([("id", "int", False), ("customer_id", "int", False)])
+    )
+    connector.get_column_statistics.return_value = {
+        "id": {"null_count": 0, "distinct_count": 10, "min": None, "max": None},
+        "cust_id": {"null_count": 0, "distinct_count": 10, "min": 1, "max": 100},
+        "customer_id": {"null_count": 0, "distinct_count": 10, "min": 1, "max": 100},
+    }
+    connector.is_min_max_eligible.side_effect = lambda dt: dt.lower() == "int"
+    validator = CatalogValidator(connector)
+
+    result = validator.compare_catalogs(
+        _request(column_map={"cust_id": "customer_id"})
+    )
+
+    table = result.schemas[0].tables[0]
+    mapped = next(c for c in table.columns if c.column == "customer_id")
+    assert mapped.min_max_status == ValidationStatus.PASS
+    assert mapped.source_min == 1 and mapped.target_min == 1
+
+
+# ---------------------------------------------------------------------------
+# column_map (Phase 3: Tier 2 fingerprint uses per-side, positionally
+# aligned column-name lists; _partition_candidates excludes renamed
+# columns from bucket-column candidacy - covered above)
+# ---------------------------------------------------------------------------
+def test_column_map_fingerprint_queries_each_side_with_its_own_column_names():
+    """get_table_fingerprint must be called with the SOURCE-side name for
+    the source-catalog call and the TARGET-side name for the
+    target-catalog call - never one shared list reused for both."""
+    connector = _make_connector()
+    connector.get_table_schema.side_effect = lambda catalog, schema, table: (
+        _schema_df([("id", "int", False), ("cust_id", "int", False)])
+        if catalog == "cat_source"
+        else _schema_df([("id", "int", False), ("customer_id", "int", False)])
+    )
+    calls = []
+
+    def fake_get_table_fingerprint(catalog, schema, table, columns):
+        calls.append((catalog, list(columns)))
+        return {"row_count": 5, "hash_sum": 1, "hash_xor": 1}
+
+    connector.get_table_fingerprint.side_effect = fake_get_table_fingerprint
+    validator = CatalogValidator(connector)
+
+    validator.compare_catalogs(_request(column_map={"cust_id": "customer_id"}))
+
+    source_call = next(c for c in calls if c[0] == "cat_source")
+    target_call = next(c for c in calls if c[0] == "cat_target")
+    assert "cust_id" in source_call[1]
+    assert "customer_id" not in source_call[1]
+    assert "customer_id" in target_call[1]
+    assert "cust_id" not in target_call[1]
+
+
+# ---------------------------------------------------------------------------
+# column_map (Phase 4: Tier 3/4 row-hash use per-side, positionally
+# aligned column-name lists; primary-key/column_map collision guard)
+# ---------------------------------------------------------------------------
+def test_column_map_row_hash_queried_with_each_sides_own_column_names():
+    """get_row_hashes must be called with the SOURCE-side value-column
+    names for the source-catalog call and TARGET-side names for the
+    target-catalog call."""
+    connector = _mismatched_fingerprint_connector()
+    connector.get_table_schema.side_effect = lambda catalog, schema, table: (
+        _schema_df([("id", "int", False), ("cust_id", "int", False)])
+        if catalog == "cat_source"
+        else _schema_df([("id", "int", False), ("customer_id", "int", False)])
+    )
+    calls = []
+
+    def fake_get_row_hashes(catalog, schema, table, columns, pk, bucket_predicate=None):
+        calls.append((catalog, list(columns)))
+        return _hash_df([(1, "aaa"), (2, "bbb")])
+
+    connector.get_row_hashes.side_effect = fake_get_row_hashes
+    validator = CatalogValidator(connector)
+
+    validator.compare_catalogs(
+        _request(
+            column_map={"cust_id": "customer_id"},
+            primary_keys={"bronze.customers": ["id"]},
+        )
+    )
+
+    source_call = next(c for c in calls if c[0] == "cat_source")
+    target_call = next(c for c in calls if c[0] == "cat_target")
+    assert source_call[1] == ["cust_id"]
+    assert target_call[1] == ["customer_id"]
+
+
+def test_column_map_row_number_fallback_queried_with_each_sides_own_column_names():
+    """No primary key configured -> get_row_hashes_by_row_number must
+    also use each side's own column spelling, same positional order."""
+    connector = _mismatched_fingerprint_connector()
+    connector.get_table_schema.side_effect = lambda catalog, schema, table: (
+        _schema_df([("id", "int", False), ("cust_id", "int", False)])
+        if catalog == "cat_source"
+        else _schema_df([("id", "int", False), ("customer_id", "int", False)])
+    )
+    calls = []
+
+    def fake_get_row_hashes_by_row_number(catalog, schema, table, columns, bucket_predicate=None):
+        calls.append((catalog, list(columns)))
+        return _hash_df([(1, "aaa"), (2, "bbb")], key="row_number")
+
+    connector.get_row_hashes_by_row_number.side_effect = fake_get_row_hashes_by_row_number
+    validator = CatalogValidator(connector)
+
+    validator.compare_catalogs(
+        _request(column_map={"cust_id": "customer_id"})  # no primary_keys
+    )
+
+    source_call = next(c for c in calls if c[0] == "cat_source")
+    target_call = next(c for c in calls if c[0] == "cat_target")
+    assert "cust_id" in source_call[1]
+    assert "customer_id" not in source_call[1]
+    assert "customer_id" in target_call[1]
+    assert "cust_id" not in target_call[1]
+
+
+def test_column_map_primary_key_collision_produces_clear_error():
+    """A column configured as both a primary key AND a column_map entry
+    must produce a clear, visible error - never silently query the
+    wrong name on one side."""
+    connector = _make_connector()
+    connector.get_table_schema.side_effect = lambda catalog, schema, table: (
+        _schema_df([("cust_id", "int", False), ("name", "string", True)])
+        if catalog == "cat_source"
+        else _schema_df([("customer_id", "int", False), ("name", "string", True)])
+    )
+    validator = CatalogValidator(connector)
+
+    result = validator.compare_catalogs(
+        _request(
+            column_map={"cust_id": "customer_id"},
+            primary_keys={"bronze.customers": ["customer_id"]},
+        )
+    )
+
+    table = result.schemas[0].tables[0]
+    assert table.status == ValidationStatus.ERROR
+    assert "customer_id" in table.error
+    assert "column_map" in table.error
+
+
+# ---------------------------------------------------------------------------
+# column_map (Phase 5: Tier 5 column-diff / Data Mismatches show both
+# column names for a mapped column, using per-side value-column lists)
+# ---------------------------------------------------------------------------
+def test_column_map_tier5_column_diff_shows_both_column_names():
+    """A mismatch on a mapped column (cust_id -> customer_id) must be
+    reported with the canonical (target) name in mismatch_column and the
+    original (source) name in source_mismatch_column."""
+    connector = _mismatched_fingerprint_connector()
+    connector.get_table_schema.side_effect = lambda catalog, schema, table: (
+        _schema_df([("id", "int", False), ("cust_id", "int", False)])
+        if catalog == "cat_source"
+        else _schema_df([("id", "int", False), ("customer_id", "int", False)])
+    )
+    connector.get_row_hashes.side_effect = lambda catalog, schema, table, cols, pk, bucket_predicate=None: (
+        _hash_df([(1, "aaa"), (2, "bbb")])
+        if catalog == "cat_source"
+        else _hash_df([(1, "aaa"), (2, "zzz")])
+    )
+    connector.get_row_detail_for_keys.return_value = [
+        {
+            "key": {"id": 2},
+            "mismatched_columns": ["customer_id"],
+            "source_values": {"customer_id": "111"},
+            "target_values": {"customer_id": "222"},
+            "source_row_hash": "bbb",
+            "target_row_hash": "zzz",
+        }
+    ]
+    validator = CatalogValidator(connector)
+
+    result = validator.compare_catalogs(
+        _request(
+            column_map={"cust_id": "customer_id"},
+            primary_keys={"bronze.customers": ["id"]},
+        )
+    )
+    table = result.schemas[0].tables[0]
+
+    connector.get_row_detail_for_keys.assert_called_once()
+    call_kwargs = connector.get_row_detail_for_keys.call_args.kwargs
+    assert call_kwargs["value_columns"] == ["cust_id"]
+    assert call_kwargs["target_value_columns"] == ["customer_id"]
+
+    assert len(table.data.sample_changed_detail) == 1
+    detail = table.data.sample_changed_detail[0]
+    assert detail.mismatch_column == "customer_id"
+    assert detail.source_mismatch_column == "cust_id"
+    assert detail.source_value == "111"
+    assert detail.target_value == "222"
+
+
+def test_column_map_tier5_row_number_fallback_shows_both_column_names():
+    """Same idea for the ROW_NUMBER() fallback path (no primary key
+    configured) - get_row_detail_for_row_numbers must be called with
+    per-side order-by/value-column lists, and the resulting detail must
+    show both column names."""
+    connector = _mismatched_fingerprint_connector()
+    connector.get_table_schema.side_effect = lambda catalog, schema, table: (
+        _schema_df([("id", "int", False), ("cust_id", "int", False)])
+        if catalog == "cat_source"
+        else _schema_df([("id", "int", False), ("customer_id", "int", False)])
+    )
+    connector.get_row_hashes_by_row_number.side_effect = lambda catalog, schema, table, cols, bucket_predicate=None: (
+        _hash_df([(1, "aaa"), (2, "bbb")], key="row_number")
+        if catalog == "cat_source"
+        else _hash_df([(1, "aaa"), (2, "zzz")], key="row_number")
+    )
+    connector.get_row_detail_for_row_numbers.return_value = [
+        {
+            "key": {"row_number": 2},
+            "mismatched_columns": ["customer_id"],
+            "source_values": {"customer_id": "111"},
+            "target_values": {"customer_id": "222"},
+            "source_row_hash": "bbb",
+            "target_row_hash": "zzz",
+        }
+    ]
+    validator = CatalogValidator(connector)
+
+    result = validator.compare_catalogs(
+        _request(column_map={"cust_id": "customer_id"})  # no primary_keys
+    )
+    table = result.schemas[0].tables[0]
+
+    connector.get_row_detail_for_row_numbers.assert_called_once()
+    call_kwargs = connector.get_row_detail_for_row_numbers.call_args.kwargs
+    assert "cust_id" in call_kwargs["value_columns"]
+    assert "customer_id" in call_kwargs["target_value_columns"]
+
+    assert len(table.data.sample_changed_detail) == 1
+    detail = table.data.sample_changed_detail[0]
+    assert detail.mismatch_column == "customer_id"
+    assert detail.source_mismatch_column == "cust_id"
+    assert detail.verified is False
+
+
+# ---------------------------------------------------------------------------
+# compare_columns: missing/extra must report each side's REAL casing, not
+# the normalized (lowercased-unless-case-sensitive) dict key used only
+# for matching. Real bug: reporting the key directly meant a column
+# named e.g. "Gender" showed up as "gender" in missing/extra, and -
+# critically for column_map - _resolve_column_pairs' discard(actual_source)
+# silently failed to remove a mapped pair's stale missing/extra entry
+# because "Gender" != "gender", leaving the table permanently BLOCKING
+# even with a correct column_map entry.
+# ---------------------------------------------------------------------------
+def test_compare_columns_missing_and_extra_preserve_real_casing():
+    connector = _make_connector()
+    validator = CatalogValidator(connector)
+
+    missing, extra, common = validator.compare_columns(
+        _schema_df([("Id", "int", False), ("OnlySource", "string", True)]),
+        _schema_df([("Id", "int", False), ("OnlyTarget", "string", True)]),
+        case_sensitive=False,
+        ignore=set(),
+    )
+
+    assert missing == ["OnlySource"]
+    assert extra == ["OnlyTarget"]
+    assert common == ["Id"]
+
+
+def test_column_map_resolves_cleanly_for_mixed_case_column_names():
+    """Regression test for the real bug above, at the full
+    compare_catalogs level: a column_map pair whose names use mixed case
+    (Gender -> Gender_1, matching a real Excel-sourced table) must not
+    leave a stale, wrong-cased entry in missing_columns/extra_columns
+    that permanently BLOCKS the table."""
+    connector = _make_connector()
+    connector.get_table_schema.side_effect = lambda catalog, schema, table: (
+        _schema_df([("Id", "int", False), ("Gender", "string", True)])
+        if catalog == "cat_source"
+        else _schema_df([("Id", "int", False), ("Gender_1", "string", True)])
+    )
+    connector.get_column_statistics.return_value = {
+        "Id": {"null_count": 0, "distinct_count": 100, "min": None, "max": None},
+        "Gender": {"null_count": 0, "distinct_count": 2, "min": None, "max": None},
+        "Gender_1": {"null_count": 0, "distinct_count": 2, "min": None, "max": None},
+    }
+    validator = CatalogValidator(connector)
+
+    result = validator.compare_catalogs(
+        _request(column_map={"Gender": "Gender_1"})
+    )
+
+    table = result.schemas[0].tables[0]
+    assert table.missing_columns == []
+    assert table.extra_columns == []
+    assert table.schema_blocking is not True
+    mapped = next(c for c in table.columns if c.column == "Gender_1")
+    assert mapped.source_column == "Gender"

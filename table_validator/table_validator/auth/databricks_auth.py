@@ -29,3 +29,18 @@ def get_databricks_token(config: ValidatorConfig, env_path: Path = ENV_PATH) -> 
     """
     values = dotenv_values(env_path) if env_path.exists() else {}
     return values.get("DATABRICKS_TOKEN") or None
+
+
+def host_from_workspace_url(workspace_url: Optional[str]) -> Optional[str]:
+    """DatabricksConnector wants a bare hostname; the wizard stores a full
+    https:// workspace URL, so strip the scheme and any trailing path.
+
+    Shared by cli/main.py (building the connector for `validate`) and
+    cli/wizard.py (building a connector during `configure` for the
+    column-mapping live picker) - kept here rather than in either CLI
+    module so neither has to import from the other.
+    """
+    if not workspace_url:
+        return None
+    host = workspace_url.replace("https://", "").replace("http://", "")
+    return host.split("/")[0]

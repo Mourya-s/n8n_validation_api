@@ -702,9 +702,16 @@ class CatalogValidator:
         # aborts here - no further tier runs, no further SQL. A
         # NON-BLOCKING difference (nullable, column order) is recorded
         # but execution continues into Tier 1+.
-        blocking, common_cols = self._tier0_schema(
+        blocking, common_pairs, column_map_errors = self._tier0_schema(
             request, target_schema, target_table, source_schema_df, target_schema_df, result,
         )
+        # Flat, target-side-name view for Tiers 1-5, which are converted
+        # to consume common_pairs directly in later phases of this
+        # feature. Positional order is preserved from common_pairs (sorted
+        # by source name in _resolve_column_pairs) - this list is NOT
+        # independently re-sorted, so it stays aligned with common_pairs
+        # for any tier still keying off it by index.
+        common_cols = [t for _s, t in common_pairs]
 
         if blocking:
             result.tier_reached = ValidationTier.SCHEMA_BLOCKED
@@ -714,7 +721,9 @@ class CatalogValidator:
                 "no further tier will run",
                 target_schema, target_table,
             )
-            if not common_cols:
+            if column_map_errors:
+                result.error = "; ".join(column_map_errors)
+            elif not common_cols:
                 result.error = "No common columns between source and target"
             result.status = self.calculate_overall_status(
                 [
@@ -754,7 +763,7 @@ class CatalogValidator:
         # difference with no row-level detail at all.
         stats_mismatch = self._tier1_statistics(
             request, source_schema, target_schema, source_table, target_table,
-            common_cols, source_schema_df, result,
+            common_pairs, source_schema_df, result,
         )
 
         stats_only_ceiling = request.max_tier == ValidationTier.STATISTICAL
@@ -798,7 +807,7 @@ class CatalogValidator:
         # happens to collide (e.g. a min/max-only mismatch on a column
         # excluded from hashing).
         fingerprint_matches = self._tier2_fingerprint(
-            request, source_schema, target_schema, source_table, target_table, common_cols, result,
+            request, source_schema, target_schema, source_table, target_table, common_pairs, result,
         )
 
         if fingerprint_matches and not stats_mismatch:
@@ -835,7 +844,7 @@ class CatalogValidator:
             # Tier 4 (+ Tier 5 for any ROW_HASH_MISMATCH keys).
             self._dispatch_tier4(
                 request, source_schema, target_schema, source_table, target_table,
-                common_cols, result,
+                common_pairs, result,
                 stats_mismatch=stats_mismatch,
             )
 
@@ -879,13 +888,137 @@ class CatalogValidator:
             if norm(str(c)) not in ignore and str(c).lower() not in ignore
         }
 
-        missing = sorted(set(src_cols) - set(tgt_cols))
-        extra = sorted(set(tgt_cols) - set(src_cols))
+        # missing/extra must report each side's REAL casing (src_cols[k]/
+        # tgt_cols[k]), not the normalized dict key used only for
+        # case-insensitive matching - the key is lowercased whenever
+        # case_sensitive is False, and reporting it directly here was
+        # silently displaying/comparing the wrong-cased name downstream.
+        missing = sorted(src_cols[k] for k in (set(src_cols) - set(tgt_cols)))
+        extra = sorted(tgt_cols[k] for k in (set(tgt_cols) - set(src_cols)))
         common = sorted(
             src_cols[k] for k in (set(src_cols) & set(tgt_cols))
         )
 
         return missing, extra, common
+
+    # ------------------------------------------------------------------
+    # Column pair resolution: identical-name intersection (compare_columns,
+    # unchanged above) PLUS request.column_map for individual columns
+    # renamed between source and target. Mirrors _resolve_table_pairs one
+    # level down (columns within an already-matched table pair, instead
+    # of tables within an already-matched schema pair) - same resolution
+    # order, same "explicit pair references a name that doesn't exist"
+    # error surfacing, same precedence (a mapped pair supersedes any
+    # coincidental identical-name pair already seeded for that source
+    # column).
+    # ------------------------------------------------------------------
+    def _resolve_column_pairs(
+        self,
+        request: CatalogValidationRequest,
+        source_schema_df: pd.DataFrame,
+        target_schema_df: pd.DataFrame,
+        case_sensitive: bool,
+        ignore: Set[str],
+    ) -> Tuple[List[Tuple[str, str]], List[str], List[str], List[str]]:
+        """
+        Returns (common_pairs, missing, extra, explicit_pair_errors).
+
+        common_pairs is a list of (source_column_name, target_column_name)
+        - identical-name pairs from compare_columns(), plus any
+        request.column_map pairs that resolve to real columns on both
+        sides (using each side's real casing). Sorted by source name -
+        callers must preserve this order (never re-sort either side's
+        names independently) so that any downstream per-side name list
+        derived from these pairs stays positionally aligned: a renamed
+        column's new spelling can shift its alphabetical rank on one
+        side only, which would silently misalign a hash/row-number
+        comparison if each side were sorted on its own name instead of
+        by this shared pair order.
+
+        missing/extra are the identical-name leftovers, with any name a
+        column_map entry successfully accounted for removed (a mapped
+        column should not also show up as missing/extra just because it
+        didn't equal-match by name). explicit_pair_errors carries a
+        human-readable message for every column_map entry that names a
+        column that does not exist on one side or the other, so it can
+        be surfaced as a visible error rather than a silent skip.
+        """
+        missing, extra, common = self.compare_columns(
+            source_schema_df, target_schema_df, case_sensitive, ignore
+        )
+
+        if not request.column_map:
+            common_pairs = [(name, name) for name in common]
+            return common_pairs, missing, extra, []
+
+        common_pairs = [(name, name) for name in common]
+        missing_set = set(missing)
+        extra_set = set(extra)
+        explicit_pair_errors: List[str] = []
+
+        all_source_columns = [str(c) for c in source_schema_df["column_name"]]
+        all_target_columns = [str(c) for c in target_schema_df["column_name"]]
+
+        source_by_lower = {c.lower(): c for c in all_source_columns}
+        target_by_lower = {c.lower(): c for c in all_target_columns}
+
+        existing_pairs_lower = {(s.lower(), t.lower()) for s, t in common_pairs}
+
+        for src_name, tgt_name in request.column_map.items():
+            actual_source = source_by_lower.get(src_name.lower())
+            actual_target = target_by_lower.get(tgt_name.lower())
+
+            if actual_source is None or actual_target is None:
+                missing_side = []
+                if actual_source is None:
+                    missing_side.append(
+                        f"column '{src_name}' does not exist on the source side"
+                    )
+                if actual_target is None:
+                    missing_side.append(
+                        f"column '{tgt_name}' does not exist on the target side"
+                    )
+                explicit_pair_errors.append(
+                    f"Configured column mapping '{src_name}' -> '{tgt_name}': "
+                    + "; ".join(missing_side)
+                )
+                continue
+
+            # ignore_columns still wins over a mapped pair, checked
+            # against either side's spelling - same "always excluded"
+            # precedence already established between ignore_columns and
+            # only_columns. An ignored pair is dropped entirely, not left
+            # dangling as "missing"/"extra" - it was never meant to be
+            # compared at all, mapped or not.
+            if actual_source.lower() in ignore or actual_target.lower() in ignore:
+                missing_set.discard(actual_source)
+                extra_set.discard(actual_target)
+                continue
+
+            pair_key = (actual_source.lower(), actual_target.lower())
+            if pair_key in existing_pairs_lower:
+                continue
+
+            # An explicit mapping for this source column supersedes any
+            # identical-name pair already seeded for it (e.g. a
+            # coincidental same-named column on both sides).
+            common_pairs = [
+                (s, t) for s, t in common_pairs if s.lower() != actual_source.lower()
+            ]
+            existing_pairs_lower = {(s.lower(), t.lower()) for s, t in common_pairs}
+
+            common_pairs.append((actual_source, actual_target))
+            existing_pairs_lower.add(pair_key)
+            missing_set.discard(actual_source)
+            extra_set.discard(actual_target)
+
+        common_pairs.sort(key=lambda pair: pair[0])
+        return (
+            common_pairs,
+            sorted(missing_set),
+            sorted(extra_set),
+            explicit_pair_errors,
+        )
 
     # ------------------------------------------------------------------
     # Stage 7: data types (per-column, used above; exposed for reuse/tests)
@@ -974,28 +1107,38 @@ class CatalogValidator:
         source_schema_df: pd.DataFrame,
         target_schema_df: pd.DataFrame,
         result: TableValidationResult,
-    ) -> Tuple[bool, List[str]]:
+    ) -> Tuple[bool, List[Tuple[str, str]], List[str]]:
         """
-        Returns (blocking, common_cols). When blocking is True, the caller
-        must abort the table immediately without running any further tier.
+        Returns (blocking, common_pairs, column_map_errors). When blocking
+        is True, the caller must abort the table immediately without
+        running any further tier. common_pairs is a list of
+        (source_column_name, target_column_name), sorted by source name -
+        every downstream tier must derive per-side name lists from this
+        SAME ordered list (never re-sort either side's names on its own),
+        since a renamed column's alphabetical rank can differ between
+        sides. column_map_errors carries any "mapped column doesn't
+        actually exist" message, which the caller must surface as a
+        visible failure rather than a silent no-op.
         """
         ignore = {c.lower() for c in (request.ignore_columns or [])}
         column_enabled = ValidationType.COLUMN in request.enabled_validations
 
-        missing_cols, extra_cols, common_cols = self.compare_columns(
-            source_schema_df, target_schema_df, request.case_sensitive_columns, ignore
+        common_pairs, missing_cols, extra_cols, column_map_errors = self._resolve_column_pairs(
+            request, source_schema_df, target_schema_df, request.case_sensitive_columns, ignore
         )
 
-        # only_columns (allowlist): restrict the already-computed common
+        # only_columns (allowlist): restrict the already-resolved common
         # set to just these names, same case-insensitive convention as
-        # ignore_columns above. A name here that isn't actually a common
-        # column is silently absent from the effective set (matching
-        # tables/schemas' existing restriction-field convention) - it is
-        # NOT reported as missing/extra, since it was never confirmed to
+        # ignore_columns above - matched against the resolved/canonical
+        # (target-side) name, so a column_map pair is addressed by its
+        # new name here. A name here that isn't actually a common column
+        # is silently absent from the effective set (matching tables/
+        # schemas' existing restriction-field convention) - it is NOT
+        # reported as missing/extra, since it was never confirmed to
         # exist on both sides in the first place.
         if request.only_columns:
             allowed = {c.lower() for c in request.only_columns}
-            common_cols = [c for c in common_cols if c.lower() in allowed]
+            common_pairs = [(s, t) for s, t in common_pairs if t.lower() in allowed]
 
         ignore_datatype = {c.lower() for c in (request.ignore_datatype_columns or [])}
 
@@ -1008,20 +1151,56 @@ class CatalogValidator:
         else:
             result.columns_status = ValidationStatus.SKIPPED
 
-        if missing_cols or extra_cols or not common_cols:
+        if column_map_errors:
+            # A column_map entry naming a column that doesn't exist on
+            # one side must produce a visible failure, never a silent
+            # no-op or a PASS that quietly ignores the misconfiguration.
+            result.columns_status = ValidationStatus.ERROR
+
+        if missing_cols or extra_cols or not common_pairs:
             # Missing/extra columns are always BLOCKING, regardless of
             # whether COLUMN reporting is enabled - Tier 0's detection is
             # a correctness prerequisite for every downstream tier, same
             # as compare_columns() always running today for common_cols.
-            return True, common_cols
+            return True, common_pairs, column_map_errors
+
+        if column_map_errors:
+            # A column_map entry naming a column that doesn't actually
+            # exist on one side must never be a silent no-op - abort the
+            # table with the error surfaced, same convention as
+            # missing/extra columns above.
+            return True, common_pairs, column_map_errors
 
         # Configured PK column missing from either side is also BLOCKING -
         # every later tier depends on being able to resolve a usable key.
         configured_key = self._lookup_primary_key(request, schema_name, table_name)
         if configured_key:
-            common_lower = {c.lower() for c in common_cols}
+            common_lower = {t.lower() for _s, t in common_pairs}
             if any(k.lower() not in common_lower for k in configured_key):
-                return True, common_cols
+                return True, common_pairs, column_map_errors
+
+            # Known, accepted limitation: the row-hash/Tier 5 machinery
+            # passes the primary key as ONE shared column-name list to
+            # both catalogs (get_row_hashes, get_row_detail_for_keys,
+            # etc.) - a key column that was ALSO renamed via column_map
+            # would silently query the wrong name on one side. Surface
+            # this as a clear, visible error rather than let it produce
+            # wrong SQL or a confusing downstream failure.
+            renamed_lower = {
+                s.lower() for s, t in common_pairs if s.lower() != t.lower()
+            } | {
+                t.lower() for s, t in common_pairs if s.lower() != t.lower()
+            }
+            key_collisions = [k for k in configured_key if k.lower() in renamed_lower]
+            if key_collisions:
+                column_map_errors = list(column_map_errors) + [
+                    f"Primary key column(s) {key_collisions} cannot also be "
+                    "renamed via column_map - a column used as the join key "
+                    "for row-level comparison must have the identical name "
+                    "on both sides."
+                ]
+                result.columns_status = ValidationStatus.ERROR
+                return True, common_pairs, column_map_errors
 
         # Per-column NON-BLOCKING checks: type family, nullable, order.
         src_by_col = {
@@ -1032,42 +1211,61 @@ class CatalogValidator:
         }
 
         if column_enabled:
+            source_to_target = {s.lower(): t for s, t in common_pairs}
+            common_source_lower = set(source_to_target)
+            common_target_lower = {t.lower() for _s, t in common_pairs}
+
+            # Reported as-is (each side's own real column spelling).
             source_order = [
                 c for c in source_schema_df["column_name"].tolist()
-                if c.lower() in {x.lower() for x in common_cols}
+                if c.lower() in common_source_lower
             ]
             target_order = [
                 c for c in target_schema_df["column_name"].tolist()
-                if c.lower() in {x.lower() for x in common_cols}
+                if c.lower() in common_target_lower
             ]
             result.source_column_order = source_order
             result.target_column_order = target_order
 
             if request.validate_column_order:
-                result.column_order_status = self.compare_column_order(source_order, target_order)
+                # Compare using the CANONICAL (target-side) name for both
+                # sequences, so a column_map-renamed column's differing
+                # spelling never registers as an order mismatch on its
+                # own - only a genuine positional difference does.
+                canonical_source_order = [
+                    source_to_target[c.lower()] for c in source_order
+                ]
+                result.column_order_status = self.compare_column_order(
+                    canonical_source_order, target_order
+                )
             else:
                 result.column_order_status = ValidationStatus.SKIPPED
 
             dtype_statuses, nullable_statuses = [], []
             column_results: List[ColumnValidationResult] = []
 
-            for col in common_cols:
-                key = col.lower()
-                src_row = src_by_col.get(key, {})
-                tgt_row = tgt_by_col.get(key, {})
+            for src_col, tgt_col in common_pairs:
+                src_key = src_col.lower()
+                tgt_key = tgt_col.lower()
+                src_row = src_by_col.get(src_key, {})
+                tgt_row = tgt_by_col.get(tgt_key, {})
 
-                col_result = ColumnValidationResult(column=col, status=ValidationStatus.PASS)
+                col_result = ColumnValidationResult(column=tgt_col, status=ValidationStatus.PASS)
+                if src_key != tgt_key:
+                    col_result.source_column = src_col
 
                 src_type = str(src_row.get("data_type"))
                 tgt_type = str(tgt_row.get("data_type"))
                 col_result.source_data_type = src_type
                 col_result.target_data_type = tgt_type
-                if key in ignore_datatype:
+                if src_key in ignore_datatype or tgt_key in ignore_datatype:
                     # User asked to ignore this column's datatype
                     # entirely - report SKIPPED, not PASS/FAIL, so a real
                     # type difference here is visibly disclosed as
                     # "intentionally not checked" rather than looking
-                    # like the types happened to match.
+                    # like the types happened to match. Checked against
+                    # both spellings since the user may not yet know the
+                    # canonical (target) name for a newly-mapped column.
                     col_result.data_type_status = ValidationStatus.SKIPPED
                 else:
                     col_result.data_type_status = self._classify_type_family(src_type, tgt_type)
@@ -1101,16 +1299,17 @@ class CatalogValidator:
         # except for a column the user explicitly put in
         # ignore_datatype_columns, which must never abort the table on a
         # type difference it was told to disregard.
-        for col in common_cols:
-            key = col.lower()
-            if key in ignore_datatype:
+        for src_col, tgt_col in common_pairs:
+            src_key = src_col.lower()
+            tgt_key = tgt_col.lower()
+            if src_key in ignore_datatype or tgt_key in ignore_datatype:
                 continue
-            src_type = str(src_by_col.get(key, {}).get("data_type"))
-            tgt_type = str(tgt_by_col.get(key, {}).get("data_type"))
+            src_type = str(src_by_col.get(src_key, {}).get("data_type"))
+            tgt_type = str(tgt_by_col.get(tgt_key, {}).get("data_type"))
             if self._classify_type_family(src_type, tgt_type) == ValidationStatus.FAIL:
-                return True, common_cols
+                return True, common_pairs, column_map_errors
 
-        return False, common_cols
+        return False, common_pairs, column_map_errors
 
     # ------------------------------------------------------------------
     # Tier 1: statistical profile. One aggregate query per side (row
@@ -1124,11 +1323,19 @@ class CatalogValidator:
         target_schema: str,
         source_table: str,
         target_table: str,
-        common_cols: List[str],
+        common_pairs: List[Tuple[str, str]],
         source_schema_df: pd.DataFrame,
         result: TableValidationResult,
     ) -> bool:
-        """Returns True if a statistical mismatch was found (stop the funnel here)."""
+        """Returns True if a statistical mismatch was found (stop the funnel here).
+
+        common_pairs is (source_column_name, target_column_name), in the
+        SAME order Tier 0 resolved it in - source-side and target-side
+        name lists derived from it (source_names/target_names below) must
+        stay positionally aligned to each other; neither is independently
+        re-sorted, since a renamed column's alphabetical rank can differ
+        between sides.
+        """
         column_enabled = ValidationType.COLUMN in request.enabled_validations
         mismatch = False
 
@@ -1154,24 +1361,32 @@ class CatalogValidator:
             result.error = f"Row count failed: {exc}"
             mismatch = True
 
+        source_names = [src for src, _tgt in common_pairs]
+        target_names = [tgt for _src, tgt in common_pairs]
+
         src_by_col = {
             str(r["column_name"]).lower(): r for _, r in source_schema_df.iterrows()
         }
-        min_max_columns = [
-            c for c in common_cols
+        # min_max_pairs preserves the same (source, target) pairing as
+        # common_pairs, restricted to eligible columns - this is what
+        # keeps the per-side min/max column lists passed to
+        # get_column_statistics positionally aligned to each other.
+        min_max_pairs = [
+            (src, tgt) for src, tgt in common_pairs
             if self.databricks.is_min_max_eligible(
-                str(src_by_col.get(c.lower(), {}).get("data_type", ""))
+                str(src_by_col.get(src.lower(), {}).get("data_type", ""))
             )
         ]
+        min_max_target_lower = {tgt.lower() for _src, tgt in min_max_pairs}
 
         try:
             source_stats = self.databricks.get_column_statistics(
                 request.source_catalog, source_schema, source_table,
-                common_cols, min_max_columns,
+                source_names, [src for src, _tgt in min_max_pairs],
             )
             target_stats = self.databricks.get_column_statistics(
                 request.target_catalog, target_schema, target_table,
-                common_cols, min_max_columns,
+                target_names, [tgt for _src, tgt in min_max_pairs],
             )
             stats_error = None
         except Exception as exc:
@@ -1182,22 +1397,30 @@ class CatalogValidator:
             stats_error = str(exc)
             mismatch = True
 
+        # Keyed by the canonical (target) name, matching Tier 0's
+        # ColumnValidationResult.column.
         existing_by_col = {c.column: c for c in result.columns}
         null_statuses, distinct_statuses, minmax_statuses = [], [], []
 
-        for col in common_cols:
-            col_result = existing_by_col.get(col)
+        for src_col, tgt_col in common_pairs:
+            col_result = existing_by_col.get(tgt_col)
             if col_result is None:
-                col_result = ColumnValidationResult(column=col, status=ValidationStatus.PASS)
-                existing_by_col[col] = col_result
+                col_result = ColumnValidationResult(column=tgt_col, status=ValidationStatus.PASS)
+                if src_col.lower() != tgt_col.lower():
+                    col_result.source_column = src_col
+                existing_by_col[tgt_col] = col_result
 
             if stats_error:
                 col_result.null_count_status = ValidationStatus.ERROR
                 col_result.distinct_count_status = ValidationStatus.ERROR
                 col_result.error = stats_error
             else:
-                s_stat = source_stats.get(col, {})
-                t_stat = target_stats.get(col, {})
+                # Positional merge: each side's stats dict is keyed by
+                # THAT side's own column name (source_stats by source
+                # names, target_stats by target names) - never a single
+                # shared string used to index both.
+                s_stat = source_stats.get(src_col, {})
+                t_stat = target_stats.get(tgt_col, {})
 
                 col_result.source_null_count = s_stat.get("null_count")
                 col_result.target_null_count = t_stat.get("null_count")
@@ -1215,7 +1438,7 @@ class CatalogValidator:
                 if col_result.distinct_count_status == ValidationStatus.FAIL:
                     mismatch = True
 
-                if col in min_max_columns:
+                if tgt_col.lower() in min_max_target_lower:
                     col_result.source_min = s_stat.get("min")
                     col_result.source_max = s_stat.get("max")
                     col_result.target_min = t_stat.get("min")
@@ -1253,7 +1476,7 @@ class CatalogValidator:
         result.null_counts_status = self.calculate_overall_status(null_statuses)
         result.distinct_counts_status = self.calculate_overall_status(distinct_statuses)
         result.min_max_status = self.calculate_overall_status(minmax_statuses)
-        result.columns = [existing_by_col[c] for c in common_cols]
+        result.columns = [existing_by_col[tgt] for _src, tgt in common_pairs]
 
         return mismatch
 
@@ -1272,18 +1495,25 @@ class CatalogValidator:
         target_schema: str,
         source_table: str,
         target_table: str,
-        common_cols: List[str],
+        common_pairs: List[Tuple[str, str]],
         result: TableValidationResult,
     ) -> bool:
-        """Returns True if the fingerprints match (stop the funnel here)."""
-        value_columns = sorted(common_cols)
+        """Returns True if the fingerprints match (stop the funnel here).
+
+        common_pairs is (source_column_name, target_column_name); the two
+        per-side name lists derived from it below must stay positionally
+        aligned (never independently re-sorted) so the two fingerprint
+        hashes remain comparable even when a column was renamed.
+        """
+        source_names = [src for src, _tgt in common_pairs]
+        target_names = [tgt for _src, tgt in common_pairs]
 
         try:
             source_fp = self.databricks.get_table_fingerprint(
-                request.source_catalog, source_schema, source_table, value_columns,
+                request.source_catalog, source_schema, source_table, source_names,
             )
             target_fp = self.databricks.get_table_fingerprint(
-                request.target_catalog, target_schema, target_table, value_columns,
+                request.target_catalog, target_schema, target_table, target_names,
             )
         except Exception as exc:
             logger.exception(
@@ -1331,11 +1561,32 @@ class CatalogValidator:
     # ------------------------------------------------------------------
     @staticmethod
     def _partition_candidates(
-        common_cols: List[str],
+        common_pairs: List[Tuple[str, str]],
         key_columns: Optional[List[str]],
     ) -> List[str]:
+        """Returns target-side candidate names (the partition-column
+        picker is a target-schema-scoped UI, per _dispatch_tier4's
+        convention below).
+
+        Known limitation: a column used as the bucket column here is
+        later queried against BOTH catalogs using this one name
+        (get_table_fingerprint_by_bucket's bucket_column parameter) - a
+        column that only exists under this exact name on the target side
+        (i.e. one actually renamed via column_map) must not be offered
+        here, since the source-side query would fail to find it. This is
+        a documented, accepted limitation of this feature, not something
+        this method's caller currently guards against.
+        """
         key_lower = {k.lower() for k in (key_columns or [])}
-        return sorted(c for c in common_cols if c.lower() not in key_lower)
+        target_lower_to_source = {t.lower(): s for s, t in common_pairs}
+        return sorted(
+            t for _s, t in common_pairs
+            if t.lower() not in key_lower
+            # Exclude a genuinely renamed column from bucket-column
+            # candidacy entirely (see limitation above) - only offer
+            # columns whose name is identical on both sides.
+            and target_lower_to_source.get(t.lower(), "").lower() == t.lower()
+        )
 
     # ------------------------------------------------------------------
     # Tier 4 dispatch: decides between partitioned and unpartitioned Tier
@@ -1353,7 +1604,7 @@ class CatalogValidator:
         target_schema: str,
         source_table: str,
         target_table: str,
-        common_cols: List[str],
+        common_pairs: List[Tuple[str, str]],
         result: TableValidationResult,
         stats_mismatch: bool = False,
     ) -> None:
@@ -1364,7 +1615,7 @@ class CatalogValidator:
             result.partition_skip_reason = None  # too small to even offer
             self._tier4_and_5_row_level(
                 request, source_schema, target_schema, source_table, target_table,
-                common_cols, result,
+                common_pairs, result,
                 stats_mismatch=stats_mismatch,
             )
             return
@@ -1373,18 +1624,19 @@ class CatalogValidator:
             result.partition_skip_reason = "no partition_prompt configured"
             self._tier4_and_5_row_level(
                 request, source_schema, target_schema, source_table, target_table,
-                common_cols, result,
+                common_pairs, result,
                 stats_mismatch=stats_mismatch,
             )
             return
 
         # Keyed by TARGET-side name, same convention as _lookup_primary_key
         # everywhere else (this is what the user types into config as
-        # "target_table.table"). common_cols is the already-agreed common
-        # column list, so it's identical regardless of which side's names
-        # are used for the partition candidate list/UI prompt.
+        # "target_table.table"). _partition_candidates returns target-
+        # side names and already excludes any genuinely renamed column
+        # from candidacy (see its docstring) - the partition candidate
+        # list/UI prompt is target-schema-scoped.
         key_columns = self._lookup_primary_key(request, target_schema, target_table)
-        candidates = self._partition_candidates(common_cols, key_columns)
+        candidates = self._partition_candidates(common_pairs, key_columns)
 
         context = PartitionPromptContext(
             schema_name=target_schema,
@@ -1407,14 +1659,14 @@ class CatalogValidator:
             result.partition_skip_reason = "user declined or non-interactive run"
             self._tier4_and_5_row_level(
                 request, source_schema, target_schema, source_table, target_table,
-                common_cols, result,
+                common_pairs, result,
                 stats_mismatch=stats_mismatch,
             )
             return
 
         self._tier3_partition_and_tier4(
             request, source_schema, target_schema, source_table, target_table,
-            common_cols, result,
+            common_pairs, result,
             chosen_column, stats_mismatch=stats_mismatch,
         )
 
@@ -1432,19 +1684,28 @@ class CatalogValidator:
         target_schema: str,
         source_table: str,
         target_table: str,
-        common_cols: List[str],
+        common_pairs: List[Tuple[str, str]],
         result: TableValidationResult,
         bucket_column: str,
         stats_mismatch: bool = False,
     ) -> None:
-        value_columns = sorted(common_cols)
+        """
+        bucket_column is always an identical-name column on both sides -
+        _partition_candidates (Tier 3 candidate selection) already
+        excludes any column_map-renamed column from candidacy, so it is
+        safe to use as-is against both catalogs here. The value column
+        lists derived from common_pairs, by contrast, may legitimately
+        differ per side and must stay positionally aligned.
+        """
+        source_names = [src for src, _tgt in common_pairs]
+        target_names = [tgt for _src, tgt in common_pairs]
 
         try:
             source_buckets = self.databricks.get_table_fingerprint_by_bucket(
-                request.source_catalog, source_schema, source_table, value_columns, bucket_column,
+                request.source_catalog, source_schema, source_table, source_names, bucket_column,
             )
             target_buckets = self.databricks.get_table_fingerprint_by_bucket(
-                request.target_catalog, target_schema, target_table, value_columns, bucket_column,
+                request.target_catalog, target_schema, target_table, target_names, bucket_column,
             )
         except Exception as exc:
             logger.exception(
@@ -1455,7 +1716,7 @@ class CatalogValidator:
             result.partition_skip_reason = f"bucket fingerprint failed: {exc}"
             self._tier4_and_5_row_level(
                 request, source_schema, target_schema, source_table, target_table,
-                common_cols, result,
+                common_pairs, result,
                 stats_mismatch=stats_mismatch,
             )
             return
@@ -1498,7 +1759,7 @@ class CatalogValidator:
         for bucket_value in culprit_buckets:
             self._tier4_and_5_row_level(
                 request, source_schema, target_schema, source_table, target_table,
-                common_cols, result,
+                common_pairs, result,
                 stats_mismatch=stats_mismatch,
                 bucket_predicate=(bucket_column, bucket_value),
                 _accumulate=accumulate,
@@ -1537,7 +1798,7 @@ class CatalogValidator:
                 if key_columns and mismatched_keys:
                     self._tier5_column_diff(
                         request, source_schema, target_schema, source_table, target_table,
-                        common_cols,
+                        common_pairs,
                         key_columns, mismatched_keys, result,
                     )
                     result.tier_reached = ValidationTier.COLUMN_DIFF
@@ -1570,7 +1831,7 @@ class CatalogValidator:
         target_schema: str,
         source_table: str,
         target_table: str,
-        common_cols: List[str],
+        common_pairs: List[Tuple[str, str]],
         result: TableValidationResult,
         stats_mismatch: bool = False,
         bucket_predicate: Optional[Tuple[str, Any]] = None,
@@ -1601,14 +1862,14 @@ class CatalogValidator:
         try:
             if using_row_number_fallback:
                 mismatches, mismatch_count, mismatch_pct = self._run_row_hash_stage_by_row_number(
-                    request, source_schema, target_schema, source_table, target_table, common_cols,
+                    request, source_schema, target_schema, source_table, target_table, common_pairs,
                     bucket_predicate=bucket_predicate,
                 )
                 effective_key_columns = ["row_number"]
             else:
                 mismatches, mismatch_count, mismatch_pct = self._run_row_hash_stage(
                     request, source_schema, target_schema, source_table, target_table,
-                    common_cols, row_hash_key_columns,
+                    common_pairs, row_hash_key_columns,
                     bucket_predicate=bucket_predicate,
                 )
                 effective_key_columns = row_hash_key_columns
@@ -1669,7 +1930,7 @@ class CatalogValidator:
                 if mismatched_keys:
                     self._tier5_column_diff(
                         request, source_schema, target_schema, source_table, target_table,
-                        common_cols,
+                        common_pairs,
                         effective_key_columns, mismatched_keys, result,
                         using_row_number_fallback=using_row_number_fallback,
                         bucket_predicate=bucket_predicate,
@@ -1722,7 +1983,7 @@ class CatalogValidator:
         target_schema: str,
         source_table: str,
         target_table: str,
-        common_cols: List[str],
+        common_pairs: List[Tuple[str, str]],
         key_columns: List[str],
         mismatched_keys: List[str],
         result: TableValidationResult,
@@ -1741,7 +2002,10 @@ class CatalogValidator:
         # source-side name doesn't actually exist under the target's own
         # catalog, which would already have been caught as a BLOCKING
         # Tier 0 schema difference or a missing-table pair error before
-        # Tier 5 could ever run.
+        # Tier 5 could ever run. key_columns itself is assumed identical
+        # on both sides (a key column renamed via column_map is guarded
+        # against as a BLOCKING error at Tier 0, before Tier 5 ever runs).
+        key_lower = {k.lower() for k in key_columns}
         if using_row_number_fallback:
             # No real key to exclude - every common column is a value
             # column. This MUST match the column list/order used to
@@ -1749,13 +2013,17 @@ class CatalogValidator:
             # _run_row_hash_stage_by_row_number, or the re-fetched row
             # numbers here won't line up with the mismatch's stored
             # "row_number" values.
-            value_columns = sorted(common_cols)
+            value_pairs = common_pairs
         else:
-            value_columns = sorted(
-                c for c in common_cols if c.lower() not in {k.lower() for k in key_columns}
-            )
-        if not value_columns:
+            value_pairs = [
+                (src, tgt) for src, tgt in common_pairs
+                if src.lower() not in key_lower and tgt.lower() not in key_lower
+            ]
+        if not value_pairs:
             return
+
+        source_value_names = [src for src, _tgt in value_pairs]
+        target_value_names = [tgt for _src, tgt in value_pairs]
 
         # mismatched_keys are the "|"-joined display keys from
         # compare_row_hashes; for a single-column key this is directly
@@ -1775,11 +2043,13 @@ class CatalogValidator:
                     target_catalog=request.target_catalog,
                     schema=target_schema,
                     table=target_table,
-                    order_by_columns=value_columns,
+                    order_by_columns=source_value_names,
                     row_numbers=[int(k) for k in mismatched_keys],
-                    value_columns=value_columns,
+                    value_columns=source_value_names,
                     limit_samples=request.max_sample_rows,
                     bucket_predicate=bucket_predicate,
+                    target_order_by_columns=target_value_names,
+                    target_value_columns=target_value_names,
                 )
             else:
                 detail = self.databricks.get_row_detail_for_keys(
@@ -1789,8 +2059,9 @@ class CatalogValidator:
                     table=target_table,
                     key_column=key_columns[0],
                     key_values=mismatched_keys,
-                    value_columns=value_columns,
+                    value_columns=source_value_names,
                     limit_samples=request.max_sample_rows,
+                    target_value_columns=target_value_names,
                 )
         except Exception as exc:
             logger.exception(
@@ -1800,15 +2071,26 @@ class CatalogValidator:
                 result.data.error = f"Column-level diff failed: {exc}"
             return
 
+        # Results come back keyed/labeled by the canonical (target)
+        # column name already (see _changed_row_detail/
+        # get_row_detail_for_row_numbers) - map back to the source
+        # spelling only to populate source_mismatch_column when it
+        # actually differs.
+        target_to_source = {tgt.lower(): src for src, tgt in value_pairs}
+
         sample_changed_detail: List[RowMismatchDetail] = []
         for row in detail:
             for col in row["mismatched_columns"]:
+                src_col = target_to_source.get(col.lower())
                 sample_changed_detail.append(
                     RowMismatchDetail(
                         schema_name=target_schema,
                         table=target_table,
                         primary_key=row["key"],
                         mismatch_column=col,
+                        source_mismatch_column=(
+                            src_col if src_col and src_col.lower() != col.lower() else None
+                        ),
                         source_value=row["source_values"].get(col),
                         target_value=row["target_values"].get(col),
                         source_row_hash=row["source_row_hash"],
@@ -1976,28 +2258,39 @@ class CatalogValidator:
         target_schema: str,
         source_table: str,
         target_table: str,
-        common_columns: List[str],
+        common_pairs: List[Tuple[str, str]],
         key_columns: List[str],
         bucket_predicate: Optional[Tuple[str, Any]] = None,
     ) -> Tuple[List[RowHashMismatch], int, float]:
-
-        value_columns = sorted(
-            c for c in common_columns if c.lower() not in {k.lower() for k in key_columns}
-        )
+        """
+        key_columns is still a single shared list used identically on
+        both sides (known, accepted limitation of column_map: a column
+        configured as a primary key must not also be renamed via
+        column_map - guarded against at request-resolution time, not
+        here). value column lists are derived from common_pairs and stay
+        positionally aligned between the two get_row_hashes calls.
+        """
+        key_lower = {k.lower() for k in key_columns}
+        value_pairs = [
+            (src, tgt) for src, tgt in common_pairs
+            if src.lower() not in key_lower and tgt.lower() not in key_lower
+        ]
+        source_value_names = [src for src, _tgt in value_pairs]
+        target_value_names = [tgt for _src, tgt in value_pairs]
 
         logger.info(
             "[row-hash] fetching hashes | table=%s.%s | key_columns=%s | value_columns=%s"
             "%s",
-            target_schema, target_table, key_columns, value_columns,
+            target_schema, target_table, key_columns, target_value_names,
             f" | bucket={bucket_predicate}" if bucket_predicate else "",
         )
 
         source_hashes = self.databricks.get_row_hashes(
-            request.source_catalog, source_schema, source_table, value_columns, key_columns,
+            request.source_catalog, source_schema, source_table, source_value_names, key_columns,
             bucket_predicate=bucket_predicate,
         )
         target_hashes = self.databricks.get_row_hashes(
-            request.target_catalog, target_schema, target_table, value_columns, key_columns,
+            request.target_catalog, target_schema, target_table, target_value_names, key_columns,
             bucket_predicate=bucket_predicate,
         )
 
@@ -2015,30 +2308,32 @@ class CatalogValidator:
         target_schema: str,
         source_table: str,
         target_table: str,
-        common_columns: List[str],
+        common_pairs: List[Tuple[str, str]],
         bucket_predicate: Optional[Tuple[str, Any]] = None,
     ) -> Tuple[List[RowHashMismatch], int, float]:
         """
         Fallback used when no primary key is configured for the table:
         both sides get a synthetic ROW_NUMBER() (ORDER BY every common
-        column) instead of a real key. See
+        column, in each side's own spelling but the SAME positional
+        order as common_pairs) instead of a real key. See
         DatabricksConnector.get_row_hashes_by_row_number for the caveat
         about what this can and cannot detect.
         """
-        value_columns = sorted(common_columns)
+        source_names = [src for src, _tgt in common_pairs]
+        target_names = [tgt for _src, tgt in common_pairs]
 
         logger.info(
             "[row-hash] fetching row-number hashes | table=%s.%s | value_columns=%s%s",
-            target_schema, target_table, value_columns,
+            target_schema, target_table, target_names,
             f" | bucket={bucket_predicate}" if bucket_predicate else "",
         )
 
         source_hashes = self.databricks.get_row_hashes_by_row_number(
-            request.source_catalog, source_schema, source_table, value_columns,
+            request.source_catalog, source_schema, source_table, source_names,
             bucket_predicate=bucket_predicate,
         )
         target_hashes = self.databricks.get_row_hashes_by_row_number(
-            request.target_catalog, target_schema, target_table, value_columns,
+            request.target_catalog, target_schema, target_table, target_names,
             bucket_predicate=bucket_predicate,
         )
 

@@ -163,6 +163,87 @@ def _prompt_column_customization(config: ValidatorConfig) -> None:
     ) or []
 
 
+def _prompt_column_mapping(config: ValidatorConfig, secrets: Dict[str, str]) -> None:
+    """
+    Optional column-name mapping for the single named table (same scope
+    as primary_key/column customization) - lets the user pair up
+    individual columns that were renamed between source and target (e.g.
+    source has 'cust_id', target has 'customer_id').
+
+    Connects to Databricks LIVE (the first time this wizard ever does so
+    during `configure`, rather than only at `validate` time) to fetch
+    both tables' real column lists, so the picker can be built from
+    actual columns rather than blind free-text entry. Any failure along
+    the way (missing/bad credentials, network issue, wrong table name,
+    insufficient permissions) is caught broadly and degrades to silently
+    skipping this step - `configure` must never crash just because this
+    optional, nice-to-have step couldn't reach Databricks. secrets may
+    not yet contain a freshly-typed token if the user is configuring for
+    the first time in this same run, so DATABRICKS_TOKEN is checked
+    there first, falling back to whatever's already on disk.
+    """
+    from table_validator.auth.databricks_auth import (
+        ENV_PATH,
+        get_databricks_token,
+        host_from_workspace_url,
+    )
+    from table_validator.connectors.databricks_connector import DatabricksConnector
+
+    try:
+        token = secrets.get("DATABRICKS_TOKEN") or get_databricks_token(config, ENV_PATH)
+        if not token:
+            return
+        databricks = DatabricksConnector(
+            host=host_from_workspace_url(config.databricks.workspace_url),
+            token=token,
+            http_path=config.databricks.http_path,
+        )
+        source_columns_df = databricks.get_table_schema(
+            config.source_table.catalog, config.source_table.schema_name, config.source_table.table
+        )
+        target_columns_df = databricks.get_table_schema(
+            config.target_table.catalog, config.target_table.schema_name, config.target_table.table
+        )
+    except Exception:
+        # Any connection/auth/query failure here just means the live
+        # picker isn't available this run - column_map can still be set
+        # later by re-running configure, or left unset entirely.
+        return
+
+    source_names = [str(c) for c in source_columns_df["column_name"]]
+    target_names = [str(c) for c in target_columns_df["column_name"]]
+    target_lower = {t.lower() for t in target_names}
+
+    unmatched_source = [s for s in source_names if s.lower() not in target_lower]
+    if not unmatched_source:
+        # Every source column already has an identical-name match -
+        # nothing to map, so don't ask anything at all.
+        return
+
+    source_lower = {s.lower() for s in source_names}
+    remaining_target = [t for t in target_names if t.lower() not in source_lower]
+
+    typer.echo(
+        f"\n{len(unmatched_source)} source column(s) have no identical-name "
+        "match in the target table - map any that were renamed (optional):"
+    )
+
+    new_map: Dict[str, str] = dict(config.column_map or {})
+    skip_label = "(skip this column)"
+    for src_col in unmatched_source:
+        if not remaining_target:
+            break
+        choice = questionary.select(
+            f"  Source column '{src_col}' has no matching target column - map it to:",
+            choices=remaining_target + [skip_label],
+        ).ask()
+        if choice and choice != skip_label:
+            new_map[src_col] = choice
+            remaining_target = [t for t in remaining_target if t != choice]
+
+    config.column_map = new_map
+
+
 def _write_env_file(values: Dict[str, str], env_path: Optional[Path] = None) -> None:
     """
     Write secrets to env_path (default: ENV_PATH, resolved at call time)
@@ -447,11 +528,17 @@ def run_configure_wizard() -> None:
         # identical behavior to before this feature existed.
         typer.echo("\n== Customize validation (optional) ==")
         _prompt_column_customization(config)
+        # Column-name mapping (renamed columns) - Databricks-to-Databricks
+        # only, since column_map/CatalogValidator don't apply to the
+        # Azure Blob/SQL source paths.
+        if config.source_type == SourceType.DATABRICKS:
+            _prompt_column_mapping(config, secrets)
     else:
         config.primary_key = None
         config.only_columns = None
         config.ignore_columns = []
         config.ignore_datatype_columns = []
+        config.column_map = {}
 
     # ------------------------------------------------------------------
     # 5. Validations to run
