@@ -488,6 +488,35 @@ class CatalogValidationRequest(BaseModel):
 
     ignore_columns: List[str] = Field(default_factory=list)
 
+    only_columns: Optional[List[str]] = Field(
+        default=None,
+        description=(
+            "Optional allowlist: if set, common_cols is further restricted "
+            "to just these column names (case-insensitive) before any "
+            "check runs - every other common column is excluded from name/"
+            "type/nullable/statistics/row-hash checks entirely, the same "
+            "as ignore_columns' exclusion. A name here that isn't actually "
+            "a common column is silently absent from the effective set, "
+            "matching this class's other restriction fields (schemas/ "
+            "tables). If a column appears in both only_columns and "
+            "ignore_columns, ignore_columns wins - it is always excluded, "
+            "applied after the allowlist restriction."
+        ),
+    )
+
+    ignore_datatype_columns: List[str] = Field(
+        default_factory=list,
+        description=(
+            "Columns (case-insensitive) whose data_type_status should be "
+            "reported as SKIPPED rather than PASS/FAIL, and excluded from "
+            "Tier 0's BLOCKING cross-family-type-change classification - "
+            "a real type difference on one of these columns never fails "
+            "the table or aborts the schema stage. The column's other "
+            "checks (nullable, null/distinct/min-max statistics, row-"
+            "hash) still run normally."
+        ),
+    )
+
     case_sensitive_columns: bool = Field(
         default=False,
         description="Case-sensitive column name comparison.",
@@ -569,7 +598,10 @@ class CatalogValidationRequest(BaseModel):
         ),
     )
 
-    @field_validator("schemas", "tables", "ignore_columns", mode="before")
+    @field_validator(
+        "schemas", "tables", "ignore_columns", "only_columns",
+        "ignore_datatype_columns", mode="before",
+    )
     @classmethod
     def _ensure_list(cls, value: Any) -> Any:
         if value is None:

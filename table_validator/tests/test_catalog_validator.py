@@ -1652,3 +1652,114 @@ def test_table_map_entry_matching_identical_name_is_not_duplicated():
 
     schema_result = result.schemas[0]
     assert len(schema_result.tables) == 1
+
+
+# ---------------------------------------------------------------------------
+# only_columns (allowlist) / ignore_datatype_columns
+# ---------------------------------------------------------------------------
+def test_only_columns_restricts_common_cols_to_allowlist():
+    """only_columns further restricts the already-computed common set -
+    a column not in the allowlist is excluded from every check (name/
+    type/nullable/statistics), even though it's genuinely common to
+    both sides."""
+    connector = _make_connector()
+    connector.get_table_schema.return_value = _schema_df(
+        [("id", "int", False), ("name", "string", True), ("email", "string", True)]
+    )
+    connector.get_column_statistics.return_value = {
+        "id": {"null_count": 0, "distinct_count": 100, "min": None, "max": None},
+        "name": {"null_count": 2, "distinct_count": 95, "min": None, "max": None},
+        "email": {"null_count": 0, "distinct_count": 100, "min": None, "max": None},
+    }
+    validator = CatalogValidator(connector)
+
+    result = validator.compare_catalogs(_request(only_columns=["id", "name"]))
+
+    table = result.schemas[0].tables[0]
+    assert [c.column for c in table.columns] == ["id", "name"]
+    assert "email" not in [c.column for c in table.columns]
+    # Not reported as missing/extra - it was never confirmed absent, just
+    # excluded by the allowlist.
+    assert table.missing_columns == []
+    assert table.extra_columns == []
+
+
+def test_only_columns_name_not_actually_common_is_silently_absent():
+    """A name in only_columns that isn't a real common column doesn't
+    error or appear anywhere - it's just absent from the effective set,
+    matching tables/schemas' existing restriction-field convention."""
+    connector = _make_connector()
+    validator = CatalogValidator(connector)
+
+    result = validator.compare_catalogs(
+        _request(only_columns=["id", "does_not_exist_column"])
+    )
+
+    table = result.schemas[0].tables[0]
+    assert [c.column for c in table.columns] == ["id"]
+    assert result.status != ValidationStatus.ERROR
+
+
+def test_ignore_columns_wins_over_only_columns_for_same_column():
+    """If a column appears in both only_columns and ignore_columns,
+    ignore_columns wins - it is always excluded."""
+    connector = _make_connector()
+    validator = CatalogValidator(connector)
+
+    result = validator.compare_catalogs(
+        _request(only_columns=["id", "name"], ignore_columns=["name"])
+    )
+
+    table = result.schemas[0].tables[0]
+    assert [c.column for c in table.columns] == ["id"]
+
+
+def test_ignore_datatype_columns_reports_skipped_not_fail():
+    """A column in ignore_datatype_columns with genuinely different types
+    across a type family (e.g. string vs int - normally BLOCKING) must
+    report SKIPPED, never FAIL, and must not abort the table."""
+    connector = _make_connector()
+    connector.get_table_schema.side_effect = lambda catalog, schema, table: (
+        _schema_df([("id", "int", False), ("legacy_flag", "string", True)])
+        if catalog == "cat_source"
+        else _schema_df([("id", "int", False), ("legacy_flag", "int", True)])
+    )
+    connector.get_column_statistics.return_value = {
+        "id": {"null_count": 0, "distinct_count": 100, "min": None, "max": None},
+        "legacy_flag": {"null_count": 0, "distinct_count": 2, "min": None, "max": None},
+    }
+    validator = CatalogValidator(connector)
+
+    result = validator.compare_catalogs(
+        _request(ignore_datatype_columns=["legacy_flag"])
+    )
+
+    table = result.schemas[0].tables[0]
+    # Never BLOCKING - Tier 1+ actually ran (not SCHEMA_BLOCKED).
+    assert table.tier_reached != ValidationTier.SCHEMA_BLOCKED
+    assert table.schema_blocking is not True
+    legacy_col = next(c for c in table.columns if c.column == "legacy_flag")
+    assert legacy_col.data_type_status == ValidationStatus.SKIPPED
+    # The column's OTHER checks still ran normally.
+    assert legacy_col.nullable_status in (ValidationStatus.PASS, ValidationStatus.FAIL)
+
+
+def test_ignore_datatype_columns_does_not_affect_unlisted_columns():
+    """A genuine cross-family type change on a column NOT in
+    ignore_datatype_columns still BLOCKS the table as before - the new
+    field only suppresses the columns explicitly named."""
+    connector = _make_connector()
+    connector.get_table_schema.side_effect = lambda catalog, schema, table: (
+        _schema_df([("id", "int", False), ("name", "string", True)])
+        if catalog == "cat_source"
+        else _schema_df([("id", "int", False), ("name", "int", True)])
+    )
+    validator = CatalogValidator(connector)
+
+    result = validator.compare_catalogs(
+        _request(ignore_datatype_columns=["some_other_column"])
+    )
+
+    table = result.schemas[0].tables[0]
+    assert table.schema_blocking is True
+    assert table.tier_reached == ValidationTier.SCHEMA_BLOCKED

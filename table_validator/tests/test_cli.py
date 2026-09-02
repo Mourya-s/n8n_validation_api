@@ -1107,6 +1107,51 @@ def test_validate_no_primary_key_configured_uses_row_number_fallback(tmp_path: P
     mock_connector.get_row_hashes.assert_not_called()
 
 
+def test_validate_databricks_wires_only_columns_ignore_columns_and_ignore_datatype(
+    tmp_path: Path,
+) -> None:
+    """config.only_columns/ignore_columns/ignore_datatype_columns must
+    reach CatalogValidationRequest unchanged - these were previously
+    silently dropped (the fields didn't exist on ValidatorConfig at all,
+    and _run_databricks_validation never passed them even once added)."""
+    config_path = _full_config(tmp_path)
+    config = load_config(config_path)
+    config.only_columns = ["id", "name"]
+    config.ignore_columns = ["updated_at"]
+    config.ignore_datatype_columns = ["legacy_flag"]
+    save_config(config, config_path)
+    output_path = tmp_path / "validation_report.xlsx"
+
+    mock_connector = _mock_databricks_connector()
+
+    captured_requests = []
+    from table_validator.validators.catalog_validator import CatalogValidator
+
+    real_compare_catalogs = CatalogValidator.compare_catalogs
+
+    def spy_compare_catalogs(self, request):
+        captured_requests.append(request)
+        return real_compare_catalogs(self, request)
+
+    with patch(
+        "table_validator.cli.main.DatabricksConnector", return_value=mock_connector
+    ), patch(
+        "table_validator.cli.main.get_databricks_token", return_value="dapi_fake"
+    ), patch(
+        "table_validator.cli.main.get_azure_credential", return_value=None
+    ), patch.object(CatalogValidator, "compare_catalogs", spy_compare_catalogs):
+        runner.invoke(
+            app,
+            ["validate", "--config-path", str(config_path), "--output", str(output_path)],
+        )
+
+    assert len(captured_requests) == 1
+    request = captured_requests[0]
+    assert request.only_columns == ["id", "name"]
+    assert request.ignore_columns == ["updated_at"]
+    assert request.ignore_datatype_columns == ["legacy_flag"]
+
+
 def test_validate_mode_stats_stops_before_fingerprint_and_row_hash(tmp_path: Path) -> None:
     """--mode stats is the CLI-flag equivalent of the tiered funnel's
     "statistical only" prompt: it must stop after Tier 1 even though the

@@ -986,6 +986,19 @@ class CatalogValidator:
             source_schema_df, target_schema_df, request.case_sensitive_columns, ignore
         )
 
+        # only_columns (allowlist): restrict the already-computed common
+        # set to just these names, same case-insensitive convention as
+        # ignore_columns above. A name here that isn't actually a common
+        # column is silently absent from the effective set (matching
+        # tables/schemas' existing restriction-field convention) - it is
+        # NOT reported as missing/extra, since it was never confirmed to
+        # exist on both sides in the first place.
+        if request.only_columns:
+            allowed = {c.lower() for c in request.only_columns}
+            common_cols = [c for c in common_cols if c.lower() in allowed]
+
+        ignore_datatype = {c.lower() for c in (request.ignore_datatype_columns or [])}
+
         if column_enabled:
             result.missing_columns = missing_cols
             result.extra_columns = extra_cols
@@ -1049,7 +1062,15 @@ class CatalogValidator:
                 tgt_type = str(tgt_row.get("data_type"))
                 col_result.source_data_type = src_type
                 col_result.target_data_type = tgt_type
-                col_result.data_type_status = self._classify_type_family(src_type, tgt_type)
+                if key in ignore_datatype:
+                    # User asked to ignore this column's datatype
+                    # entirely - report SKIPPED, not PASS/FAIL, so a real
+                    # type difference here is visibly disclosed as
+                    # "intentionally not checked" rather than looking
+                    # like the types happened to match.
+                    col_result.data_type_status = ValidationStatus.SKIPPED
+                else:
+                    col_result.data_type_status = self._classify_type_family(src_type, tgt_type)
                 dtype_statuses.append(col_result.data_type_status)
 
                 if request.validate_nullable:
@@ -1076,9 +1097,14 @@ class CatalogValidator:
             result.nullable_status = ValidationStatus.SKIPPED
 
         # Cross-family type change is BLOCKING even when COLUMN reporting
-        # is disabled (detection always runs; only reporting is gated).
+        # is disabled (detection always runs; only reporting is gated) -
+        # except for a column the user explicitly put in
+        # ignore_datatype_columns, which must never abort the table on a
+        # type difference it was told to disregard.
         for col in common_cols:
             key = col.lower()
+            if key in ignore_datatype:
+                continue
             src_type = str(src_by_col.get(key, {}).get("data_type"))
             tgt_type = str(tgt_by_col.get(key, {}).get("data_type"))
             if self._classify_type_family(src_type, tgt_type) == ValidationStatus.FAIL:

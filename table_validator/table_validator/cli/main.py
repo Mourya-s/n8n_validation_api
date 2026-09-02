@@ -148,7 +148,7 @@ def info() -> None:
         "Run 'tablevalidator <command> --help' for a command's full "
         "options (e.g. tablevalidator validate --help).\n"
         "\n"
-        "TO KEERTHIVASAN"
+        "-MS-"
     )
 
 
@@ -470,6 +470,9 @@ def _run_databricks_validation(
         enabled_validations=set(config.validations),
         primary_keys=primary_keys,
         max_tier=max_tier,
+        only_columns=config.only_columns,
+        ignore_columns=config.ignore_columns,
+        ignore_datatype_columns=config.ignore_datatype_columns,
     )
 
     partition_prompt = build_partition_prompt(yes=yes)

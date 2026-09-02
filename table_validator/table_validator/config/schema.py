@@ -166,6 +166,42 @@ class ValidatorConfig(BaseModel):
         ),
     )
 
+    only_columns: Optional[List[str]] = Field(
+        default=None,
+        description=(
+            "Optional allowlist: if set, only these columns (plus the "
+            "primary key, if any) are compared - every other common "
+            "column is excluded from every check. Only meaningful for the "
+            "single named table in source_table/target_table, same scope "
+            "as primary_key. If a column named here isn't actually common "
+            "to both sides, it's silently absent from the effective set "
+            "(same convention as tables/schemas restrictions elsewhere). "
+            "If both only_columns and ignore_columns name the same "
+            "column, ignore_columns wins - it is always excluded."
+        ),
+    )
+
+    ignore_columns: List[str] = Field(
+        default_factory=list,
+        description=(
+            "Columns to exclude entirely from every check (name, type, "
+            "nullable, statistics, row-hash) - useful for auto-generated "
+            "columns like timestamps that are expected to always differ."
+        ),
+    )
+
+    ignore_datatype_columns: List[str] = Field(
+        default_factory=list,
+        description=(
+            "Columns whose data-type mismatch should be ignored - the "
+            "column's other checks (nullable, statistics, row-hash) still "
+            "run normally, but a real type difference here is reported as "
+            "SKIPPED rather than FAIL and never fails the table or aborts "
+            "the schema stage, even for a cross-family type change that "
+            "would otherwise be BLOCKING."
+        ),
+    )
+
     blob_source: BlobSourceConfig = Field(default_factory=BlobSourceConfig)
     sql_source: SqlSourceConfig = Field(default_factory=SqlSourceConfig)
 
