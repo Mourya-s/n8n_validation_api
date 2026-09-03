@@ -67,22 +67,26 @@ if TYPE_CHECKING:
     from pyspark.sql import SparkSession
 
 
-def _parse_fqtn(name: str, label: str) -> Tuple[str, str, str]:
+def _parse_source_target(name: str, label: str) -> Tuple[str, str, Optional[str]]:
     """
-    Parse a fully-qualified 'catalog.schema.table' string into its three
-    parts. Raises ValueError with a clear message if `name` isn't exactly
-    three non-empty, dot-separated parts - there is no existing parser to
-    reuse for this shape (the CLI always keeps catalog/schema/table as
+    Parse either "catalog.schema.table" (single-table comparison - the
+    returned table is never None) or "catalog.schema" (schema-wide sweep
+    - every identically-named table in the schema, optionally renamed via
+    validate_tables()'s table_map param; the returned table is None) into
+    its parts. Raises ValueError with a clear message for anything else
+    (wrong part count, or any blank part) - there is no existing parser
+    to reuse for this shape (the CLI always keeps catalog/schema/table as
     separate ValidatorConfig fields, never a single combined string).
     """
-    parts = name.split(".")
-    if len(parts) != 3 or not all(p.strip() for p in parts):
-        raise ValueError(
-            f"{label} must be a fully-qualified 'catalog.schema.table' "
-            f"name, got: {name!r}"
-        )
-    catalog, schema, table = (p.strip() for p in parts)
-    return catalog, schema, table
+    parts = [p.strip() for p in name.split(".")]
+    if len(parts) == 3 and all(parts):
+        return parts[0], parts[1], parts[2]
+    if len(parts) == 2 and all(parts):
+        return parts[0], parts[1], None
+    raise ValueError(
+        f"{label} must be a fully-qualified 'catalog.schema.table' name "
+        f"(or 'catalog.schema' for a schema-wide sweep), got: {name!r}"
+    )
 
 
 def _format_summary_text(data: SummaryData, result: CatalogValidationResponse) -> str:
@@ -272,17 +276,37 @@ def validate_tables(
     target: str,
     *,
     primary_key: Optional[List[str]] = None,
+    table_map: Optional[Dict[str, str]] = None,
     spark: Optional["SparkSession"] = None,
     ignore_columns: Optional[List[str]] = None,
     only_columns: Optional[List[str]] = None,
     column_map: Optional[Dict[str, str]] = None,
+    ignore_datatype_columns: Optional[List[str]] = None,
 ) -> ValidationResult:
     """
-    Validate one source table against one target table, using the
-    notebook's own ambient SparkSession - no workspace URL, personal
-    access token, or SQL Warehouse HTTP path needed.
+    Validate a source against a target, using the notebook's own ambient
+    SparkSession - no workspace URL, personal access token, or SQL
+    Warehouse HTTP path needed. Two modes, selected by whether `source`/
+    `target` name a table:
 
-    `source`/`target` are fully-qualified `"catalog.schema.table"` names.
+    - Single-table: `"catalog.schema.table"` on both sides - compares
+      exactly that one source table against that one target table (the
+      two table names don't need to match; a differing name is handled
+      automatically).
+    - Schema-wide sweep: `"catalog.schema"` (no table) on BOTH sides -
+      compares every table with an identical name common to both
+      schemas, auto-discovered with zero further configuration (the same
+      mechanism the CLI's own blank-table config triggers). Pass
+      `table_map` to additionally compare specific tables that were
+      renamed between source and target (e.g. source has 'cust', target
+      has 'customers') - unmapped tables are still matched by identical
+      name as usual. `primary_key` is rejected in this mode (a single key
+      can't apply to every table in the sweep - compare one table at a
+      time if you need row-level detail via a real key).
+
+    Mixing the two (a table named on only one side) is rejected with a
+    clear error, since it's always ambiguous.
+
     Runs the same full-depth tiered comparison the CLI's own `--mode full`
     (the CLI's default) does - schema/column checks, row counts, null/
     distinct/min-max statistics, whole-table fingerprint, and (if a
@@ -291,48 +315,90 @@ def validate_tables(
     ValidationTier.COLUMN_DIFF, enabled_validations=all four types) already
     equal the CLI's "full" mode; this function does not override either.
 
-    `primary_key`, if given, is used for row-level comparison instead of
-    the synthetic ROW_NUMBER() fallback - same tradeoff as the CLI's own
-    `primary_key` config field. `ignore_columns`/`only_columns`/
-    `column_map` mirror the identically-named CatalogValidationRequest
-    fields.
+    `primary_key`, if given (single-table mode only), is used for row-
+    level comparison instead of the synthetic ROW_NUMBER() fallback -
+    same tradeoff as the CLI's own `primary_key` config field.
+    `table_map` (sweep mode only), `ignore_columns`, `only_columns`,
+    `column_map`, `ignore_datatype_columns` mirror the identically-named
+    CatalogValidationRequest fields.
+
+    `ignore_datatype_columns`, if given, names columns (case-insensitive,
+    checked against both the source and target spelling) whose data type
+    should never fail the comparison - a genuine type difference on one
+    of these columns is reported as SKIPPED rather than PASS/FAIL, and
+    (critically) is excluded from Tier 0's BLOCKING cross-family-type-
+    change check, so a type change alone on one of these columns never
+    aborts the table before row-level comparison even runs. The column's
+    other checks (nullable, null/distinct/min-max statistics, row-hash)
+    still run normally - only its data type is ignored. Useful when a
+    migration is known to have changed a column's type on purpose (e.g.
+    STRING -> INT) and you only want to check the row/value-level data,
+    not re-litigate the type change every run.
 
     Returns a ValidationResult: `print(result)` alone shows a compact
     plain-text summary (no rich/box-drawing formatting, safe to print
-    directly in a notebook cell); `print(result.table_validation)`,
+    directly in a notebook cell, and correctly listing every table when
+    a sweep matched more than one); `print(result.table_validation)`,
     `.column_validation`, `.data_mismatches`, `.row_hash_mismatches`,
     `.mismatch_categories`, `.suggestions` each print one specific
     sheet's data as a plain-text table, mirroring the Excel report's own
     sheets one-for-one.
     """
-    src_catalog, src_schema, src_table = _parse_fqtn(source, "source")
-    tgt_catalog, tgt_schema, tgt_table = _parse_fqtn(target, "target")
+    src_catalog, src_schema, src_table = _parse_source_target(source, "source")
+    tgt_catalog, tgt_schema, tgt_table = _parse_source_target(target, "target")
 
     connector = SparkConnector(spark=spark)
 
     schema_map: Dict[str, str] = (
         {src_schema: tgt_schema} if src_schema.lower() != tgt_schema.lower() else {}
     )
-    table_map: Dict[str, str] = (
-        {src_table: tgt_table} if src_table.lower() != tgt_table.lower() else {}
-    )
 
-    primary_keys: Dict[str, list] = {}
-    if primary_key:
-        primary_keys[tgt_table] = primary_key
-        primary_keys[f"{tgt_schema}.{tgt_table}"] = primary_key
+    if src_table and tgt_table:
+        # Single-table mode.
+        tables_restriction: Optional[List[str]] = [src_table]
+        resolved_table_map: Dict[str, str] = (
+            {src_table: tgt_table} if src_table.lower() != tgt_table.lower() else {}
+        )
+        primary_keys: Dict[str, list] = {}
+        if primary_key:
+            primary_keys[tgt_table] = primary_key
+            primary_keys[f"{tgt_schema}.{tgt_table}"] = primary_key
+    elif not src_table and not tgt_table:
+        # Schema-wide sweep - leaving `tables` unset (None) is what
+        # triggers CatalogValidator's own auto-discovery of every table
+        # common to both schemas by identical name; table_map (if given)
+        # additionally pairs up specific renamed tables, mirroring
+        # cli/main.py's own schema-sweep branch exactly.
+        tables_restriction = None
+        resolved_table_map = dict(table_map or {})
+        if primary_key:
+            raise ValueError(
+                "primary_key is only meaningful for a single-table "
+                "comparison (both source and target naming a table) - "
+                "for a schema-wide sweep, each table would need its own "
+                "key. Compare one table at a time if you need a primary "
+                "key for row-level detail."
+            )
+        primary_keys = {}
+    else:
+        raise ValueError(
+            "source and target must either BOTH name a table "
+            "('catalog.schema.table') or BOTH omit it ('catalog.schema' "
+            "for a schema-wide sweep) - got a table on only one side."
+        )
 
     request = CatalogValidationRequest(
         source_catalog=src_catalog,
         target_catalog=tgt_catalog,
         schemas=[src_schema],
         schema_map=schema_map,
-        tables=[src_table],
-        table_map=table_map,
+        tables=tables_restriction,
+        table_map=resolved_table_map,
         primary_keys=primary_keys,
         ignore_columns=ignore_columns or [],
         only_columns=only_columns,
         column_map=column_map or {},
+        ignore_datatype_columns=ignore_datatype_columns or [],
         # max_tier and enabled_validations deliberately left unset - the
         # Pydantic model defaults already equal the CLI's own "full" mode
         # (see this function's docstring above).

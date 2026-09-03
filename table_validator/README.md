@@ -128,13 +128,43 @@ programmatic access, or `.to_dataframe()` if you want a real pandas
 sheet breakdown.
 
 Optional keyword arguments to `validate_tables()`: `primary_key` (a real
-key for row-level comparison instead of the ROW_NUMBER() fallback),
-`ignore_columns`, `only_columns`, `column_map` (for a renamed column).
-Outside a Databricks notebook (e.g. local development against a real
-Spark session), install the `spark` extra:
-`pip install "table-validator[spark]"` - inside an actual Databricks
-notebook, pyspark and an active session already exist, so the bare
-`%pip install table-validator` above is sufficient.
+key for row-level comparison instead of the ROW_NUMBER() fallback, single-
+table mode only), `ignore_columns`, `only_columns`, `column_map` (for a
+renamed column), `ignore_datatype_columns` (skip a real type mismatch on
+these columns rather than failing the table on it). Outside a Databricks
+notebook (e.g. local development against a real Spark session), install
+the `spark` extra: `pip install "table-validator[spark]"` - inside an
+actual Databricks notebook, pyspark and an active session already exist,
+so the bare `%pip install table-validator` above is sufficient.
+
+### Schema-wide sweep (no single table named)
+
+Leave the table off both `source`/`target` (just `"catalog.schema"`) to
+compare every identically-named table in that schema in one call - the
+same auto-discovery the CLI's own blank-table config triggers, with zero
+further setup:
+
+```python
+result = validate_tables("catalog1.bronze", "catalog2.silver")
+print(result)                  # lists every matched table's status
+print(result.table_validation) # one row per matched table
+```
+
+If some tables were renamed between source and target, pass `table_map`
+(source name &rarr; target name) - unmapped tables are still matched by
+identical name as usual:
+
+```python
+result = validate_tables(
+    "catalog1.bronze", "catalog2.silver",
+    table_map={"cust": "customers", "ord": "orders"},
+)
+```
+
+`primary_key` isn't valid in this mode (a single key can't apply to every
+table in the sweep) - compare one table at a time
+(`"catalog.schema.table"` on both sides) if you need row-level detail via
+a real key.
 
 ## Quickstart (Python API)
 

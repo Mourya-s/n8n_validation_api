@@ -36,11 +36,13 @@ def _fake_response(status=ValidationStatus.PASS, table_status=ValidationStatus.P
 
 
 # ---------------------------------------------------------------------------
-# Dotted-string parsing
+# Dotted-string parsing - "catalog.schema.table" (single-table) or
+# "catalog.schema" (schema-wide sweep) are both valid; anything else
+# (wrong part count, any blank part) is rejected.
 # ---------------------------------------------------------------------------
 def test_malformed_source_raises_value_error():
     with pytest.raises(ValueError, match="source must be"):
-        validate_tables("only.two", "cat.sch.tbl", spark=MagicMock())
+        validate_tables("just_one", "cat.sch.tbl", spark=MagicMock())
 
 
 def test_malformed_target_raises_value_error():
@@ -51,6 +53,27 @@ def test_malformed_target_raises_value_error():
 def test_blank_part_raises_value_error():
     with pytest.raises(ValueError, match="source must be"):
         validate_tables("cat..tbl", "cat.sch.tbl", spark=MagicMock())
+
+
+def test_two_part_source_and_target_is_valid_sweep_syntax():
+    """A 2-part 'catalog.schema' string on BOTH sides is now valid syntax
+    (schema-wide sweep) - must not raise at the parsing stage."""
+    with patch("table_validator.notebook.SparkConnector", return_value=MagicMock()), \
+         patch(
+             "table_validator.notebook.CatalogValidator.compare_catalogs",
+             return_value=_fake_response(),
+         ):
+        validate_tables("cat1.sch1", "cat1.sch1", spark=MagicMock())  # must not raise
+
+
+def test_table_named_on_only_one_side_raises_value_error():
+    with pytest.raises(ValueError, match="only one side"):
+        validate_tables("cat1.sch1.t1", "cat1.sch1", spark=MagicMock())
+
+
+def test_table_named_on_only_target_side_raises_value_error():
+    with pytest.raises(ValueError, match="only one side"):
+        validate_tables("cat1.sch1", "cat1.sch1.t1", spark=MagicMock())
 
 
 # ---------------------------------------------------------------------------
@@ -113,6 +136,129 @@ def test_schema_map_and_table_map_empty_when_names_identical():
     request = captured["request"]
     assert request.schema_map == {}
     assert request.table_map == {}
+
+
+# ---------------------------------------------------------------------------
+# Schema-wide sweep mode: "catalog.schema" (no table) on BOTH sides.
+# ---------------------------------------------------------------------------
+def test_sweep_mode_leaves_tables_unset_for_auto_discovery():
+    """tables=None is what triggers CatalogValidator's own auto-discovery
+    of every identically-named table common to both schemas - a sweep
+    call must not pass any table restriction unless table_map says so."""
+    captured = {}
+
+    def fake_compare_catalogs(self, request):
+        captured["request"] = request
+        return _fake_response()
+
+    with patch("table_validator.notebook.SparkConnector", return_value=MagicMock()), \
+         patch(
+             "table_validator.notebook.CatalogValidator.compare_catalogs",
+             fake_compare_catalogs,
+         ):
+        validate_tables("cat1.bronze", "cat1.silver", spark=MagicMock())
+
+    request = captured["request"]
+    assert request.schemas == ["bronze"]
+    assert request.tables is None
+    assert request.table_map == {}
+    assert request.schema_map == {"bronze": "silver"}
+
+
+def test_sweep_mode_table_map_passes_through():
+    captured = {}
+
+    def fake_compare_catalogs(self, request):
+        captured["request"] = request
+        return _fake_response()
+
+    with patch("table_validator.notebook.SparkConnector", return_value=MagicMock()), \
+         patch(
+             "table_validator.notebook.CatalogValidator.compare_catalogs",
+             fake_compare_catalogs,
+         ):
+        validate_tables(
+            "cat1.bronze", "cat1.silver",
+            table_map={"cust": "customers", "ord": "orders"},
+            spark=MagicMock(),
+        )
+
+    request = captured["request"]
+    assert request.tables is None
+    assert request.table_map == {"cust": "customers", "ord": "orders"}
+
+
+def test_sweep_mode_schema_map_empty_when_schema_names_identical():
+    captured = {}
+
+    def fake_compare_catalogs(self, request):
+        captured["request"] = request
+        return _fake_response()
+
+    with patch("table_validator.notebook.SparkConnector", return_value=MagicMock()), \
+         patch(
+             "table_validator.notebook.CatalogValidator.compare_catalogs",
+             fake_compare_catalogs,
+         ):
+        validate_tables("cat1.sch1", "cat1.sch1", spark=MagicMock())
+
+    request = captured["request"]
+    assert request.schema_map == {}
+    assert request.tables is None
+
+
+def test_sweep_mode_primary_key_raises_value_error():
+    with pytest.raises(ValueError, match="only meaningful for a single-table"):
+        validate_tables(
+            "cat1.bronze", "cat1.silver",
+            primary_key=["id"], spark=MagicMock(),
+        )
+
+
+def test_sweep_mode_primary_keys_dict_stays_empty():
+    """Even without primary_key raising (it does), confirm the request's
+    own primary_keys dict is never populated in sweep mode - defensive
+    regression guard independent of the ValueError test above."""
+    captured = {}
+
+    def fake_compare_catalogs(self, request):
+        captured["request"] = request
+        return _fake_response()
+
+    with patch("table_validator.notebook.SparkConnector", return_value=MagicMock()), \
+         patch(
+             "table_validator.notebook.CatalogValidator.compare_catalogs",
+             fake_compare_catalogs,
+         ):
+        validate_tables("cat1.bronze", "cat1.silver", spark=MagicMock())
+
+    assert captured["request"].primary_keys == {}
+
+
+def test_single_table_mode_table_map_kwarg_ignored_in_favor_of_derived_map():
+    """table_map is documented as sweep-mode-only; single-table mode
+    already derives its own table_map from the two table names and must
+    not be affected by an explicit table_map kwarg passed alongside it."""
+    captured = {}
+
+    def fake_compare_catalogs(self, request):
+        captured["request"] = request
+        return _fake_response()
+
+    with patch("table_validator.notebook.SparkConnector", return_value=MagicMock()), \
+         patch(
+             "table_validator.notebook.CatalogValidator.compare_catalogs",
+             fake_compare_catalogs,
+         ):
+        validate_tables(
+            "cat1.sch1.t1", "cat1.sch1.t2",
+            table_map={"unrelated": "mapping"},
+            spark=MagicMock(),
+        )
+
+    request = captured["request"]
+    assert request.tables == ["t1"]
+    assert request.table_map == {"t1": "t2"}
 
 
 def test_primary_key_populated_under_both_lookup_forms():
@@ -182,6 +328,44 @@ def test_ignore_only_columns_and_column_map_pass_through():
     assert request.ignore_columns == ["updated_at"]
     assert request.only_columns == ["id", "name"]
     assert request.column_map == {"cust_id": "customer_id"}
+
+
+def test_ignore_datatype_columns_passes_through():
+    captured = {}
+
+    def fake_compare_catalogs(self, request):
+        captured["request"] = request
+        return _fake_response()
+
+    with patch("table_validator.notebook.SparkConnector", return_value=MagicMock()), \
+         patch(
+             "table_validator.notebook.CatalogValidator.compare_catalogs",
+             fake_compare_catalogs,
+         ):
+        validate_tables(
+            "cat1.sch1.t1", "cat1.sch1.t2",
+            ignore_datatype_columns=["salary", "age"],
+            spark=MagicMock(),
+        )
+
+    assert captured["request"].ignore_datatype_columns == ["salary", "age"]
+
+
+def test_ignore_datatype_columns_defaults_to_empty_list():
+    captured = {}
+
+    def fake_compare_catalogs(self, request):
+        captured["request"] = request
+        return _fake_response()
+
+    with patch("table_validator.notebook.SparkConnector", return_value=MagicMock()), \
+         patch(
+             "table_validator.notebook.CatalogValidator.compare_catalogs",
+             fake_compare_catalogs,
+         ):
+        validate_tables("cat1.sch1.t1", "cat1.sch1.t2", spark=MagicMock())
+
+    assert captured["request"].ignore_datatype_columns == []
 
 
 # ---------------------------------------------------------------------------
@@ -408,3 +592,59 @@ def test_table_validation_sheet_uses_vertical_layout_for_a_real_row():
     assert "--- Row 1 of 1 ---" in text
     assert "Source Schema" in text
     assert "Overall Status          : FAIL" in text
+
+
+# ---------------------------------------------------------------------------
+# End-to-end: a schema-wide sweep matching multiple tables must render
+# correctly through ValidationResult's summary and every sheet property -
+# these already loop every schema/table, so no notebook.py rendering
+# changes were needed for sweep support, only request-building; this test
+# is the regression guard proving that's actually true.
+# ---------------------------------------------------------------------------
+def _fake_sweep_response():
+    table_a = TableValidationResult(
+        schema_name="silver", table="customers", status=ValidationStatus.PASS,
+        exists_in_source=True, exists_in_target=True,
+    )
+    table_b = TableValidationResult(
+        schema_name="silver", table="orders", status=ValidationStatus.FAIL,
+        exists_in_source=True, exists_in_target=True,
+    )
+    schema = SchemaValidationResult(
+        schema_name="silver", status=ValidationStatus.FAIL, tables=[table_a, table_b],
+    )
+    return CatalogValidationResponse(
+        source_catalog="cat1", target_catalog="cat1", status=ValidationStatus.FAIL,
+        schemas=[schema],
+    )
+
+
+def test_sweep_result_summary_lists_every_matched_table():
+    with patch("table_validator.notebook.SparkConnector", return_value=MagicMock()), \
+         patch(
+             "table_validator.notebook.CatalogValidator.compare_catalogs",
+             return_value=_fake_sweep_response(),
+         ):
+        result = validate_tables("cat1.bronze", "cat1.silver", spark=MagicMock())
+
+    text = str(result)
+    assert "Per-table results:" in text
+    assert "silver.customers: PASS" in text
+    assert "silver.orders: FAIL" in text
+    assert "2 total" in text
+    assert "1 passed" in text
+    assert "1 failed" in text
+
+
+def test_sweep_result_table_validation_sheet_has_one_row_per_matched_table():
+    with patch("table_validator.notebook.SparkConnector", return_value=MagicMock()), \
+         patch(
+             "table_validator.notebook.CatalogValidator.compare_catalogs",
+             return_value=_fake_sweep_response(),
+         ):
+        result = validate_tables("cat1.bronze", "cat1.silver", spark=MagicMock())
+
+    sheet = result.table_validation
+    assert len(sheet) == 2
+    df = sheet.to_dataframe()
+    assert set(df["Source Table"]) == {"customers", "orders"}
