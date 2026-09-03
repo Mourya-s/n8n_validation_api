@@ -528,6 +528,24 @@ class BaseSqlConnector:
                 return None
             return int(value)
 
+        def _nan_to_none(value: Any) -> Any:
+            """
+            MIN/MAX over ZERO matching rows (e.g. both sides legitimately
+            empty under the same row_filter) is SQL NULL, which arrives
+            here as float NaN after the spark.sql(...).toPandas() round-
+            trip - same underlying issue as _to_int_or_none above, but
+            min/max must stay their original type (a string, date, etc.)
+            when a real value IS present, so this only strips NaN rather
+            than casting to int. Without this, two equally-empty sides
+            each report NaN for min/max, and compare_min_max's `==`
+            check treats NaN != NaN (the standard IEEE 754 quirk) as a
+            real difference - a false FAIL on a table with nothing to
+            compare, not an actual mismatch.
+            """
+            if isinstance(value, float) and value != value:
+                return None
+            return value
+
         for col in columns:
             entry: Dict[str, Any] = {
                 "null_count": _to_int_or_none(row.get(f"{col}__nulls")),
@@ -536,8 +554,8 @@ class BaseSqlConnector:
                 "max": None,
             }
             if col.lower() in min_max_set:
-                entry["min"] = row.get(f"{col}__min")
-                entry["max"] = row.get(f"{col}__max")
+                entry["min"] = _nan_to_none(row.get(f"{col}__min"))
+                entry["max"] = _nan_to_none(row.get(f"{col}__max"))
             result[col] = entry
 
         return result

@@ -198,3 +198,76 @@ def test_get_column_statistics_still_converts_real_values_to_int():
     assert stats["id"]["distinct_count"] == 42
     assert isinstance(stats["id"]["null_count"], int)
     assert isinstance(stats["id"]["distinct_count"], int)
+
+
+def test_get_column_statistics_min_max_nan_becomes_none():
+    """Real bug found via live user testing: comparing a table against
+    ITSELF with the exact same row_filter on both sides (matching zero
+    rows) still reported Overall Status FAIL, specifically Min/Max FAIL -
+    MIN/MAX over zero rows is SQL NULL -> NaN after the pandas round-
+    trip, and NaN != NaN (IEEE 754), so compare_min_max's `==` check
+    treated two equally-empty, equally-NaN sides as a real difference.
+    min/max must come back as None (not NaN) so two empty sides compare
+    equal."""
+    fake_spark = MagicMock()
+    fake_spark.sql.return_value.toPandas.return_value = pd.DataFrame(
+        {"id__nulls": [float("nan")], "id__distinct": [float("nan")],
+         "id__min": [float("nan")], "id__max": [float("nan")]}
+    )
+    connector = SparkConnector(spark=fake_spark)
+
+    stats = connector.get_column_statistics(
+        "cat", "sch", "tbl", ["id"], min_max_columns=["id"],
+    )
+
+    assert stats["id"]["min"] is None
+    assert stats["id"]["max"] is None
+
+
+def test_get_column_statistics_min_max_real_values_pass_through_unchanged():
+    """Regression guard alongside the NaN fix above - a genuine min/max
+    result (of any type - string, date, number) must pass through
+    completely unchanged, not be mistaken for NaN."""
+    fake_spark = MagicMock()
+    fake_spark.sql.return_value.toPandas.return_value = pd.DataFrame(
+        {"name__nulls": [0], "name__distinct": [5],
+         "name__min": ["Alice"], "name__max": ["Zoe"]}
+    )
+    connector = SparkConnector(spark=fake_spark)
+
+    stats = connector.get_column_statistics(
+        "cat", "sch", "tbl", ["name"], min_max_columns=["name"],
+    )
+
+    assert stats["name"]["min"] == "Alice"
+    assert stats["name"]["max"] == "Zoe"
+
+
+def test_two_identically_filtered_empty_sides_compare_as_pass():
+    """End-to-end regression test for the exact reported scenario: the
+    SAME table compared against itself with the SAME row_filter matching
+    zero rows on both sides must report min/max as equal (both None),
+    not a false mismatch."""
+    from table_validator.validators.catalog_validator import CatalogValidator
+
+    fake_spark = MagicMock()
+    connector = SparkConnector(spark=fake_spark)
+    connector.set_row_filters(common="gender = 'male'")
+
+    fake_spark.sql.return_value.toPandas.return_value = pd.DataFrame(
+        {"id__nulls": [float("nan")], "id__distinct": [float("nan")],
+         "id__min": [float("nan")], "id__max": [float("nan")]}
+    )
+    source_stats = connector.get_column_statistics(
+        "cat", "sch", "src_tbl", ["id"], min_max_columns=["id"], side="source",
+    )
+    target_stats = connector.get_column_statistics(
+        "cat", "sch", "tgt_tbl", ["id"], min_max_columns=["id"], side="target",
+    )
+
+    validator = CatalogValidator(connector)
+    status = validator.compare_min_max(
+        source_stats["id"]["min"], source_stats["id"]["max"],
+        target_stats["id"]["min"], target_stats["id"]["max"],
+    )
+    assert status.value == "PASS"
