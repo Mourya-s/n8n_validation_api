@@ -43,4 +43,31 @@ __all__ = [
     # Core request/response models
     "CatalogValidationRequest",
     "CatalogValidationResponse",
+    # Notebook-native API (lazily loaded - see __getattr__ below; pyspark
+    # is only imported when one of these two names is actually accessed).
+    "SparkConnector",
+    "validate_tables",
 ]
+
+
+def __getattr__(name: str):
+    """
+    PEP 562 module-level lazy attribute access, for the two names above
+    that transitively depend on pyspark. pyspark is NOT a hard dependency
+    of this package (CLI-only users never install it) - deferring the
+    import to actual first-access time, rather than importing eagerly
+    like everything else in this file, keeps `import table_validator`
+    working with no pyspark installed at all. Every other name in
+    __all__ is already bound by the eager imports above and resolved by
+    normal attribute lookup before Python ever calls this function -
+    __getattr__ only runs as a fallback for names lookup didn't resolve.
+    """
+    if name == "SparkConnector":
+        from table_validator.connectors.spark_connector import SparkConnector
+
+        return SparkConnector
+    if name == "validate_tables":
+        from table_validator.notebook import validate_tables
+
+        return validate_tables
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

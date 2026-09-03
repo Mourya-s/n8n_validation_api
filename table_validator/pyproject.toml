@@ -32,6 +32,13 @@ dev = [
     "ruff>=0.4",
     "black>=24.0",
 ]
+# Only needed to construct SparkConnector/call validate_tables() OUTSIDE a
+# real Databricks notebook (e.g. local dev/testing) - inside an actual
+# notebook, pyspark and an active SparkSession already exist ambiently, so
+# a bare `pip install table-validator` is sufficient there.
+spark = [
+    "pyspark>=3.4",
+]
 
 [project.scripts]
 tablevalidator = "table_validator.cli.main:app"

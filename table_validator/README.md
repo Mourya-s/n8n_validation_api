@@ -79,6 +79,36 @@ tablevalidator open
 
 Opens the most recently generated report in your default spreadsheet app.
 
+## Notebook usage (zero config, inside Databricks)
+
+From inside a Databricks notebook cell, `validate_tables()` compares two
+tables using the notebook's own already-authenticated Spark session - no
+workspace URL, personal access token, or SQL Warehouse HTTP path to set
+up. This is a second, independent way to use the package alongside the
+CLI above (pick whichever fits: the CLI for a scheduled/scripted run
+against a SQL Warehouse, this for an ad-hoc in-notebook check) - both run
+the exact same full-depth comparison engine.
+
+```python
+%pip install table-validator
+
+from table_validator import validate_tables
+
+result = validate_tables(
+    "catalog1.schema1.table1",
+    "catalog1.schema1.table2",
+)
+print(result)
+```
+
+Optional keyword arguments: `primary_key` (a real key for row-level
+comparison instead of the ROW_NUMBER() fallback), `ignore_columns`,
+`only_columns`, `column_map` (for a renamed column). Outside a Databricks
+notebook (e.g. local development against a real Spark session), install
+the `spark` extra: `pip install "table-validator[spark]"` - inside an
+actual Databricks notebook, pyspark and an active session already exist,
+so the bare `%pip install table-validator` above is sufficient.
+
 ## Quickstart (Python API)
 
 Everything the CLI does is available as a library, built from the same
@@ -133,6 +163,9 @@ Other public entry points exported from `table_validator`:
 - `ValidatorConfig`, `default_config`, `save_config`, `require_config`,
   `ConfigNotFoundError` — the same config load/save layer the CLI wizard
   uses, if you want to construct or persist configuration programmatically.
+- `validate_tables` / `SparkConnector` — the notebook-native entry point
+  described above (lazily imported: importing `table_validator` itself
+  never requires `pyspark` to be installed).
 
 ## Where config and secrets are stored
 
