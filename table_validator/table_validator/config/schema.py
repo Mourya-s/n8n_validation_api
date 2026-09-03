@@ -314,6 +314,38 @@ class ValidatorConfig(BaseModel):
         ),
     )
 
+    row_filter: Optional[str] = Field(
+        default=None,
+        description=(
+            "Optional SQL WHERE-fragment restricting comparison to matching "
+            "rows on BOTH sides (row count, statistics, row-hash/column "
+            "diff) - e.g. 'id > 20 and id < 100' or \"gender = 'male'\". "
+            "Only meaningful for the single named table in source_table/"
+            "target_table (Databricks source only). Combined with "
+            "source_row_filter/target_row_filter via AND if both are set. "
+            "Used as-is, not parsed or validated - a typo surfaces as a "
+            "normal SQL error when the query runs."
+        ),
+    )
+
+    source_row_filter: Optional[str] = Field(
+        default=None,
+        description=(
+            "Optional SQL WHERE-fragment applied only to the source side, "
+            "ANDed with row_filter if both are set. Use this (with "
+            "target_row_filter) instead of row_filter when the condition "
+            "must differ per side."
+        ),
+    )
+
+    target_row_filter: Optional[str] = Field(
+        default=None,
+        description=(
+            "Optional SQL WHERE-fragment applied only to the target side, "
+            "ANDed with row_filter if both are set."
+        ),
+    )
+
     blob_source: BlobSourceConfig = Field(default_factory=BlobSourceConfig)
     sql_source: SqlSourceConfig = Field(default_factory=SqlSourceConfig)
     synapse_source: SynapseSourceConfig = Field(default_factory=SynapseSourceConfig)

@@ -343,6 +343,7 @@ def test_deselecting_row_only_omits_row(tmp_path, monkeypatch):
         "tgt_cat", "silver", "customers",
         "",                                    # primary key (blank)
         False,                                 # customize validation? (declined)
+        False,                                 # filter to a subset of rows? (declined)
         ["catalog & schema", "column"],        # validations checkbox: row unchecked
     ])
 
@@ -417,6 +418,7 @@ def test_databricks_source_type_prompts_for_source_table(tmp_path, monkeypatch):
         "tgt_cat", "silver", "customers",   # target table
         "",                                   # primary key (left blank)
         False,                                # customize validation? (declined)
+        False,                                # filter to a subset of rows? (declined)
         [],                                  # validations
     ])
 
@@ -442,6 +444,7 @@ def test_databricks_source_type_prompts_for_primary_key_when_both_tables_named(
         "tgt_cat", "silver", "customers",
         "id, region_id ",                    # primary key, comma-separated with stray spaces
         False,                                # customize validation? (declined)
+        False,                                # filter to a subset of rows? (declined)
         [],
     ])
 
@@ -462,6 +465,7 @@ def test_databricks_wizard_declining_customization_leaves_defaults_untouched(
         "tgt_cat", "silver", "customers",
         "",                                    # primary key (left blank)
         False,                                 # customize validation? (declined)
+        False,                                 # filter to a subset of rows? (declined)
         [],
     ])
 
@@ -486,6 +490,7 @@ def test_databricks_wizard_customize_populates_all_three_column_lists(
         "id, name ",                            # only_columns, stray spaces
         "updated_at",                           # ignore_columns
         "legacy_flag, notes",                   # ignore_datatype_columns
+        False,                                  # filter to a subset of rows? (declined)
         [],
     ])
 
@@ -508,6 +513,7 @@ def test_databricks_wizard_customize_all_three_left_blank(tmp_path, monkeypatch)
         "",                                    # only_columns left blank
         "",                                    # ignore_columns left blank
         "",                                    # ignore_datatype_columns left blank
+        False,                                 # filter to a subset of rows? (declined)
         [],
     ])
 
@@ -811,6 +817,7 @@ def test_column_mapping_skipped_when_no_token_available(tmp_path, monkeypatch):
         "tgt_cat", "silver", "customers",
         "id",
         False,  # customize validation? (declined)
+        False,  # filter to a subset of rows? (declined)
         [],
     ])
 
@@ -834,6 +841,7 @@ def test_column_mapping_live_connection_success_populates_map(tmp_path, monkeypa
             "tgt_cat", "silver", "customers",
             "id",
             False,           # customize validation? (declined)
+            False,           # filter to a subset of rows? (declined)
             "customer_id",   # column mapping: cust_id -> customer_id
             [],
         ],
@@ -859,6 +867,7 @@ def test_column_mapping_live_connection_failure_skips_gracefully(tmp_path, monke
             "tgt_cat", "silver", "customers",
             "id",
             False,  # customize validation? (declined)
+            False,  # filter to a subset of rows? (declined)
             [],
         ],
         databricks_token="dapi_fake",
@@ -889,6 +898,7 @@ def test_column_mapping_only_asks_about_unmatched_source_columns(tmp_path, monke
             "tgt_cat", "silver", "customers",
             "id",
             False,
+            False,  # filter to a subset of rows? (declined)
             "customer_id",  # only ONE column-mapping answer, for cust_id
             [],
         ],
@@ -916,6 +926,7 @@ def test_column_mapping_skip_leaves_column_unmapped(tmp_path, monkeypatch):
             "tgt_cat", "silver", "customers",
             "id",
             False,
+            False,  # filter to a subset of rows? (declined)
             "(skip this column)",
             [],
         ],
@@ -941,6 +952,7 @@ def test_column_mapping_no_unmatched_columns_asks_nothing(tmp_path, monkeypatch)
             "tgt_cat", "silver", "customers",
             "id",
             False,
+            False,  # filter to a subset of rows? (declined)
             # no column-mapping answer - none should be consumed
             [],
         ],
@@ -993,6 +1005,7 @@ def test_schema_scoping_prompt_skipped_when_a_table_is_named(tmp_path, monkeypat
         "tgt_cat", "silver", "customers",
         "",                                    # primary key (blank)
         False,                                 # customize validation? (declined)
+        False,                                 # filter to a subset of rows? (declined)
         # no schema-scoping answer here - none should be consumed
         [],
     ])

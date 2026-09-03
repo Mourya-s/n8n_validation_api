@@ -192,6 +192,57 @@ def _prompt_column_customization(config: ValidatorConfig) -> None:
     ) or []
 
 
+def _prompt_row_filter(config: ValidatorConfig) -> None:
+    """Optional row-filter predicate, asked right after column
+    customization - same single-table scope, Databricks source only
+    (AzureSqlConnector has no row-filter mechanism, unlike
+    BaseSqlConnector's set_row_filters/_scoped_table that the Databricks
+    connector and the notebook-native validate_tables() API both share).
+    Skipped entirely (leaving any existing row_filter/source_row_filter/
+    target_row_filter untouched) unless the user opts in, so declining
+    gives identical behavior to before this feature existed."""
+    customize = questionary.confirm(
+        "Filter to a subset of rows? (only rows matching a condition are "
+        "compared, e.g. \"id > 10 and id < 30\" or \"gender = 'male'\")",
+        default=False,
+    ).ask()
+
+    if not customize:
+        return
+
+    same_condition = questionary.confirm(
+        "Apply the same condition to both source and target?",
+        default=True,
+    ).ask()
+
+    # Mutually exclusive in this UI - picking one must clear whatever
+    # stale value the OTHER carried over from an earlier configure run,
+    # same convention as _prompt_schema_scoping below.
+    if same_condition:
+        config.row_filter = _ask(
+            questionary.text(
+                "Row filter condition (SQL WHERE-fragment):",
+                default=config.row_filter or "",
+            )
+        ) or None
+        config.source_row_filter = None
+        config.target_row_filter = None
+    else:
+        config.row_filter = None
+        config.source_row_filter = _ask(
+            questionary.text(
+                "Source row filter condition:",
+                default=config.source_row_filter or "",
+            )
+        ) or None
+        config.target_row_filter = _ask(
+            questionary.text(
+                "Target row filter condition:",
+                default=config.target_row_filter or "",
+            )
+        ) or None
+
+
 def _prompt_schema_scoping(config: ValidatorConfig) -> None:
     """
     Optional schema-wide scoping, asked only when a schema is named on
@@ -725,10 +776,11 @@ def run_configure_wizard() -> None:
         # identical behavior to before this feature existed.
         typer.echo("\n== Customize validation (optional) ==")
         _prompt_column_customization(config)
-        # Column-name mapping (renamed columns) - Databricks-to-Databricks
-        # only, since column_map/CatalogValidator don't apply to the
-        # Azure Blob/SQL source paths.
+        # Row-filter predicate and column-name mapping (renamed columns) -
+        # Databricks-to-Databricks only, since set_row_filters/column_map/
+        # CatalogValidator don't apply to the Azure Blob/SQL source paths.
         if config.source_type == SourceType.DATABRICKS:
+            _prompt_row_filter(config)
             _prompt_column_mapping(config, secrets)
     else:
         config.primary_key = None
@@ -736,6 +788,9 @@ def run_configure_wizard() -> None:
         config.ignore_columns = []
         config.ignore_datatype_columns = []
         config.column_map = {}
+        config.row_filter = None
+        config.source_row_filter = None
+        config.target_row_filter = None
 
     # Schema-wide sweep scoping - only meaningful when a schema is named
     # on both sides but no specific table is (the single-table branch

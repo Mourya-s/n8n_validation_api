@@ -1437,6 +1437,65 @@ def test_validate_databricks_wires_only_columns_ignore_columns_and_ignore_dataty
     assert request.column_map == {"cust_id": "customer_id"}
 
 
+def test_validate_databricks_wires_row_filters_to_connector(tmp_path: Path) -> None:
+    """config.row_filter/source_row_filter/target_row_filter must reach the
+    Databricks connector via set_row_filters() before compare_catalogs runs -
+    these live purely as connector instance state (same mechanism as the
+    notebook-native validate_tables() API), never as CatalogValidationRequest
+    fields."""
+    config_path = _full_config(tmp_path)
+    config = load_config(config_path)
+    config.row_filter = "status = 'active'"
+    config.source_row_filter = "id > 20"
+    config.target_row_filter = "id > 15"
+    save_config(config, config_path)
+    output_path = tmp_path / "validation_report.xlsx"
+
+    mock_connector = _mock_databricks_connector()
+
+    with patch(
+        "table_validator.cli.main.DatabricksConnector", return_value=mock_connector
+    ), patch(
+        "table_validator.cli.main.get_databricks_token", return_value="dapi_fake"
+    ), patch(
+        "table_validator.cli.main.get_azure_credential", return_value=None
+    ):
+        runner.invoke(
+            app,
+            ["validate", "--config-path", str(config_path), "--output", str(output_path)],
+        )
+
+    mock_connector.set_row_filters.assert_called_once_with(
+        common="status = 'active'", source="id > 20", target="id > 15",
+    )
+
+
+def test_validate_databricks_skips_set_row_filters_when_none_configured(
+    tmp_path: Path,
+) -> None:
+    """A config with no row filters set must never call set_row_filters at
+    all - regression guard so a table without this feature configured
+    behaves identically to before the feature existed."""
+    config_path = _full_config(tmp_path)
+    output_path = tmp_path / "validation_report.xlsx"
+
+    mock_connector = _mock_databricks_connector()
+
+    with patch(
+        "table_validator.cli.main.DatabricksConnector", return_value=mock_connector
+    ), patch(
+        "table_validator.cli.main.get_databricks_token", return_value="dapi_fake"
+    ), patch(
+        "table_validator.cli.main.get_azure_credential", return_value=None
+    ):
+        runner.invoke(
+            app,
+            ["validate", "--config-path", str(config_path), "--output", str(output_path)],
+        )
+
+    mock_connector.set_row_filters.assert_not_called()
+
+
 def test_validate_mode_stats_stops_before_fingerprint_and_row_hash(tmp_path: Path) -> None:
     """--mode stats is the CLI-flag equivalent of the tiered funnel's
     "statistical only" prompt: it must stop after Tier 1 even though the

@@ -507,6 +507,17 @@ def _run_databricks_validation(
         column_map=config.column_map,
     )
 
+    # Row-filter predicate - lives purely as connector instance state
+    # (BaseSqlConnector.set_row_filters/_scoped_table), same mechanism as
+    # the notebook-native validate_tables() API, not a CatalogValidationRequest
+    # field. A no-op unless the user configured at least one of the three.
+    if config.row_filter or config.source_row_filter or config.target_row_filter:
+        databricks.set_row_filters(
+            common=config.row_filter,
+            source=config.source_row_filter,
+            target=config.target_row_filter,
+        )
+
     partition_prompt = build_partition_prompt(yes=yes)
     validator = CatalogValidator(databricks, partition_prompt=partition_prompt)
     return validator.compare_catalogs(request)
