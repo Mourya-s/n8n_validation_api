@@ -98,16 +98,43 @@ result = validate_tables(
     "catalog1.schema1.table1",
     "catalog1.schema1.table2",
 )
-print(result)
+print(result)  # compact summary
+```
+```
+Overall status: FAIL
+Tables: 1 total, 0 passed, 1 failed, 0 error, 0 skipped
 ```
 
-Optional keyword arguments: `primary_key` (a real key for row-level
-comparison instead of the ROW_NUMBER() fallback), `ignore_columns`,
-`only_columns`, `column_map` (for a renamed column). Outside a Databricks
-notebook (e.g. local development against a real Spark session), install
-the `spark` extra: `pip install "table-validator[spark]"` - inside an
-actual Databricks notebook, pyspark and an active session already exist,
-so the bare `%pip install table-validator` above is sufficient.
+`result` also exposes each of the Excel report's own sheets as a
+plain-text table - print only the one you want:
+
+```python
+print(result.table_validation)    # one row per table
+print(result.column_validation)   # one row per column
+print(result.data_mismatches)     # one row per mismatched cell (FULL mode)
+print(result.row_hash_mismatches) # one row per mismatched primary key
+print(result.mismatch_categories) # root-cause breakdown (NULL_MISMATCH, etc.)
+print(result.suggestions)         # plain-English fix suggestions
+```
+```
+Source Schema Source Table Overall Status  Row Count (Src)  Row Count (Tgt)  ...
+         sch1           t1           FAIL                5              100  ...
+```
+
+Each of these is a small `ResultTable` object - `.headers`/`.rows` for
+programmatic access, or `.to_dataframe()` if you want a real pandas
+`DataFrame` to filter/sort/export yourself. `result.response` is the raw
+`CatalogValidationResponse`, for full programmatic access beyond the
+sheet breakdown.
+
+Optional keyword arguments to `validate_tables()`: `primary_key` (a real
+key for row-level comparison instead of the ROW_NUMBER() fallback),
+`ignore_columns`, `only_columns`, `column_map` (for a renamed column).
+Outside a Databricks notebook (e.g. local development against a real
+Spark session), install the `spark` extra:
+`pip install "table-validator[spark]"` - inside an actual Databricks
+notebook, pyspark and an active session already exist, so the bare
+`%pip install table-validator` above is sufficient.
 
 ## Quickstart (Python API)
 

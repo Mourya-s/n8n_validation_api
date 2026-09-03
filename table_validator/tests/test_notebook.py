@@ -206,9 +206,9 @@ def test_spark_kwarg_forwarded_to_spark_connector():
 
 
 # ---------------------------------------------------------------------------
-# Plain-text rendering
+# Plain-text rendering (str(result) / print(result) - the summary)
 # ---------------------------------------------------------------------------
-def test_returns_plain_string_with_no_box_drawing_characters():
+def test_str_is_plain_text_with_no_box_drawing_characters():
     with patch("table_validator.notebook.SparkConnector", return_value=MagicMock()), \
          patch(
              "table_validator.notebook.CatalogValidator.compare_catalogs",
@@ -216,12 +216,12 @@ def test_returns_plain_string_with_no_box_drawing_characters():
          ):
         result = validate_tables("cat1.sch1.t1", "cat1.sch1.t2", spark=MagicMock())
 
-    assert isinstance(result, str)
+    text = str(result)
     box_drawing_chars = "│─┌┐└┘┡┩┏┓┗┛━┃"
-    assert not any(ch in result for ch in box_drawing_chars)
-    assert "Overall status: PASS" in result
-    assert "1 total" in result
-    assert "1 passed" in result
+    assert not any(ch in text for ch in box_drawing_chars)
+    assert "Overall status: PASS" in text
+    assert "1 total" in text
+    assert "1 passed" in text
 
 
 def test_error_text_included_when_result_has_error():
@@ -236,8 +236,9 @@ def test_error_text_included_when_result_has_error():
          ):
         result = validate_tables("cat1.sch1.t1", "cat1.sch1.t2", spark=MagicMock())
 
-    assert "Error: boom" in result
-    assert "Overall status: ERROR" in result
+    text = str(result)
+    assert "Error: boom" in text
+    assert "Overall status: ERROR" in text
 
 
 def test_per_table_lines_omitted_for_single_table():
@@ -251,4 +252,86 @@ def test_per_table_lines_omitted_for_single_table():
          ):
         result = validate_tables("cat1.sch1.t1", "cat1.sch1.t2", spark=MagicMock())
 
-    assert "Per-table results:" not in result
+    assert "Per-table results:" not in str(result)
+
+
+# ---------------------------------------------------------------------------
+# ValidationResult sheet accessors (.table_validation, .column_validation,
+# .data_mismatches, .row_hash_mismatches, .mismatch_categories, .suggestions)
+# ---------------------------------------------------------------------------
+def test_response_attribute_exposes_raw_catalog_validation_response():
+    fake_response = _fake_response()
+    with patch("table_validator.notebook.SparkConnector", return_value=MagicMock()), \
+         patch(
+             "table_validator.notebook.CatalogValidator.compare_catalogs",
+             return_value=fake_response,
+         ):
+        result = validate_tables("cat1.sch1.t1", "cat1.sch1.t2", spark=MagicMock())
+
+    assert result.response is fake_response
+
+
+def test_table_validation_returns_one_row_per_table():
+    with patch("table_validator.notebook.SparkConnector", return_value=MagicMock()), \
+         patch(
+             "table_validator.notebook.CatalogValidator.compare_catalogs",
+             return_value=_fake_response(),
+         ):
+        result = validate_tables("cat1.sch1.t1", "cat1.sch1.t2", spark=MagicMock())
+
+    sheet = result.table_validation
+    assert len(sheet) == 1
+    assert sheet.headers[0] == "Source Schema"
+    text = str(sheet)
+    box_drawing_chars = "│─┌┐└┘┡┩┏┓┗┛━┃"
+    assert not any(ch in text for ch in box_drawing_chars)
+    assert "PASS" in text
+
+
+def test_table_validation_to_dataframe_returns_real_dataframe():
+    import pandas as pd
+
+    with patch("table_validator.notebook.SparkConnector", return_value=MagicMock()), \
+         patch(
+             "table_validator.notebook.CatalogValidator.compare_catalogs",
+             return_value=_fake_response(),
+         ):
+        result = validate_tables("cat1.sch1.t1", "cat1.sch1.t2", spark=MagicMock())
+
+    df = result.table_validation.to_dataframe()
+    assert isinstance(df, pd.DataFrame)
+    assert len(df) == 1
+    assert list(df.columns) == result.table_validation.headers
+
+
+def test_empty_sheet_renders_as_no_rows_placeholder():
+    with patch("table_validator.notebook.SparkConnector", return_value=MagicMock()), \
+         patch(
+             "table_validator.notebook.CatalogValidator.compare_catalogs",
+             return_value=_fake_response(),
+         ):
+        result = validate_tables("cat1.sch1.t1", "cat1.sch1.t2", spark=MagicMock())
+
+    # This fixture's table has no data/mismatch detail at all.
+    assert str(result.data_mismatches) == "(no rows)"
+    assert len(result.data_mismatches) == 0
+
+
+def test_all_sheet_properties_are_accessible_and_return_result_table():
+    from table_validator.notebook import ResultTable
+
+    with patch("table_validator.notebook.SparkConnector", return_value=MagicMock()), \
+         patch(
+             "table_validator.notebook.CatalogValidator.compare_catalogs",
+             return_value=_fake_response(),
+         ):
+        result = validate_tables("cat1.sch1.t1", "cat1.sch1.t2", spark=MagicMock())
+
+    for attr in (
+        "table_validation", "column_validation", "data_mismatches",
+        "row_hash_mismatches", "mismatch_categories", "suggestions",
+    ):
+        sheet = getattr(result, attr)
+        assert isinstance(sheet, ResultTable)
+        # Must not raise regardless of whether the sheet has rows.
+        str(sheet)

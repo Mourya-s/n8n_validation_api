@@ -31,16 +31,36 @@ Typical usage, from a Databricks notebook cell:
         "catalog1.schema1.table1",
         "catalog1.schema1.table2",
     )
-    print(result)
+    print(result)                     # compact summary
+    print(result.table_validation)    # one row per table (like the Excel
+                                       # report's "Table Validation" sheet)
+    print(result.column_validation)   # one row per column
+    print(result.data_mismatches)     # one row per mismatched cell
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+
+import pandas as pd
 
 from table_validator.cli.summary_table import SummaryData, summary_from_response
 from table_validator.connectors.spark_connector import SparkConnector
 from table_validator.models import CatalogValidationRequest, CatalogValidationResponse
+from table_validator.reports.excel_report import (
+    CATEGORY_SUMMARY_HEADERS,
+    COLUMN_HEADERS,
+    MISMATCH_HEADERS,
+    ROW_HASH_HEADERS,
+    SUGGESTION_HEADERS,
+    TABLE_HEADERS,
+    _build_column_rows,
+    _build_mismatch_category_summary,
+    _build_mismatch_rows,
+    _build_row_hash_rows,
+    _build_suggestion_rows,
+    _build_table_rows,
+)
 from table_validator.validators.catalog_validator import CatalogValidator
 
 if TYPE_CHECKING:
@@ -65,7 +85,7 @@ def _parse_fqtn(name: str, label: str) -> Tuple[str, str, str]:
     return catalog, schema, table
 
 
-def _format_plain_text(data: SummaryData, result: CatalogValidationResponse) -> str:
+def _format_summary_text(data: SummaryData, result: CatalogValidationResponse) -> str:
     """
     Render a CatalogValidationResponse as plain text - mirroring the
     CONTENT of cli/main.py's own console summary (_print_summary: per-
@@ -104,6 +124,109 @@ def _format_plain_text(data: SummaryData, result: CatalogValidationResponse) -> 
     return "\n".join(lines)
 
 
+class ResultTable:
+    """
+    One sheet's worth of rows (mirrors an Excel report sheet - Table
+    Validation, Column Validation, Data Mismatches, etc.), printable
+    directly as an aligned plain-text table.
+
+    Backed by a pandas DataFrame (pandas is already a hard dependency of
+    this package) purely for its to_string() rendering - no rich/box-
+    drawing characters, so it copies cleanly from a notebook cell. Also
+    exposes .rows/.headers for programmatic access, and .to_dataframe()
+    for anyone who wants the real DataFrame (e.g. to filter/sort/export
+    it themselves).
+    """
+
+    def __init__(self, headers: List[str], rows: List[List[Any]]) -> None:
+        self.headers = headers
+        self.rows = rows
+
+    def to_dataframe(self) -> pd.DataFrame:
+        return pd.DataFrame(self.rows, columns=self.headers)
+
+    def __len__(self) -> int:
+        return len(self.rows)
+
+    def __repr__(self) -> str:
+        return str(self)
+
+    def __str__(self) -> str:
+        if not self.rows:
+            return "(no rows)"
+        # index=False: a notebook reader has no use for pandas' own
+        # synthetic 0..N row index here, only the sheet's real columns.
+        return self.to_dataframe().to_string(index=False)
+
+
+class ValidationResult:
+    """
+    Wraps a CatalogValidationResponse from validate_tables() with the same
+    sheet breakdown the Excel report offers, so a caller can choose which
+    one to look at - `print(result)` alone shows a compact summary;
+    `print(result.table_validation)` / `.column_validation` / etc. show
+    one specific sheet's data as a plain-text table, exactly mirroring
+    the Excel report's own sheets (built from the very same row-building
+    functions, reports/excel_report.py - never a second implementation of
+    "what a row looks like").
+
+    `.response` is the raw CatalogValidationResponse, for anyone who wants
+    full programmatic access beyond the sheet breakdown.
+    """
+
+    def __init__(self, response: CatalogValidationResponse) -> None:
+        self.response = response
+        self._summary_data = summary_from_response(response)
+
+    @property
+    def table_validation(self) -> ResultTable:
+        """One row per table - mirrors the Excel report's "Table
+        Validation" sheet: schema match, row counts, mismatch counts,
+        overall status, etc."""
+        return ResultTable(TABLE_HEADERS, _build_table_rows(self.response))
+
+    @property
+    def column_validation(self) -> ResultTable:
+        """One row per column - mirrors the Excel report's "Column
+        Validation" sheet: per-column type/nullable/null-count/distinct-
+        count/min-max status."""
+        return ResultTable(COLUMN_HEADERS, _build_column_rows(self.response))
+
+    @property
+    def data_mismatches(self) -> ResultTable:
+        """One row per mismatched cell - mirrors the Excel report's "Data
+        Mismatches" sheet. Only populated in FULL mode with a real
+        primary key or the row-number fallback; empty otherwise."""
+        return ResultTable(MISMATCH_HEADERS, _build_mismatch_rows(self.response))
+
+    @property
+    def row_hash_mismatches(self) -> ResultTable:
+        """One row per mismatched primary key - mirrors the Excel
+        report's "Row Hash Mismatches" sheet."""
+        return ResultTable(ROW_HASH_HEADERS, _build_row_hash_rows(self.response))
+
+    @property
+    def mismatch_categories(self) -> ResultTable:
+        """One row per root-cause category (NULL_MISMATCH,
+        STRING_TRUNCATION, CASE_DIFFERENCE, ...) - mirrors the Excel
+        report's "Mismatch Categories" sheet's summary table."""
+        summaries = _build_mismatch_category_summary(self.response)
+        rows = [[s.category, s.count, f"{s.pct:.2f}%", s.top_table, s.top_column] for s in summaries]
+        return ResultTable(CATEGORY_SUMMARY_HEADERS, rows)
+
+    @property
+    def suggestions(self) -> ResultTable:
+        """One plain-English suggestion per issue found on a FAILed/
+        ERRORed table - mirrors the Excel report's "Suggestions" sheet."""
+        return ResultTable(SUGGESTION_HEADERS, _build_suggestion_rows(self.response))
+
+    def __repr__(self) -> str:
+        return str(self)
+
+    def __str__(self) -> str:
+        return _format_summary_text(self._summary_data, self.response)
+
+
 def validate_tables(
     source: str,
     target: str,
@@ -113,7 +236,7 @@ def validate_tables(
     ignore_columns: Optional[List[str]] = None,
     only_columns: Optional[List[str]] = None,
     column_map: Optional[Dict[str, str]] = None,
-) -> str:
+) -> ValidationResult:
     """
     Validate one source table against one target table, using the
     notebook's own ambient SparkSession - no workspace URL, personal
@@ -134,8 +257,13 @@ def validate_tables(
     `column_map` mirror the identically-named CatalogValidationRequest
     fields.
 
-    Returns a plain-text summary (no rich/box-drawing formatting) meant to
-    be printed directly in a notebook cell, e.g. `print(result)`.
+    Returns a ValidationResult: `print(result)` alone shows a compact
+    plain-text summary (no rich/box-drawing formatting, safe to print
+    directly in a notebook cell); `print(result.table_validation)`,
+    `.column_validation`, `.data_mismatches`, `.row_hash_mismatches`,
+    `.mismatch_categories`, `.suggestions` each print one specific
+    sheet's data as a plain-text table, mirroring the Excel report's own
+    sheets one-for-one.
     """
     src_catalog, src_schema, src_table = _parse_fqtn(source, "source")
     tgt_catalog, tgt_schema, tgt_table = _parse_fqtn(target, "target")
@@ -170,7 +298,6 @@ def validate_tables(
         # (see this function's docstring above).
     )
 
-    result = CatalogValidator(connector).compare_catalogs(request)
+    response = CatalogValidator(connector).compare_catalogs(request)
 
-    summary = summary_from_response(result)
-    return _format_plain_text(summary, result)
+    return ValidationResult(response)
