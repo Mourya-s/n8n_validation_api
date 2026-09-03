@@ -507,12 +507,31 @@ class BaseSqlConnector:
 
         row = df.iloc[0]
 
+        def _to_int_or_none(value: Any) -> Optional[int]:
+            """
+            SUM/COUNT DISTINCT over ZERO rows (e.g. a row_filter that
+            legitimately matches nothing on this side) still returns
+            exactly one row from this aggregate query - but the
+            aggregate value itself is SQL NULL, which a pandas/Arrow
+            round-trip (spark.sql(...).toPandas()) represents as float
+            NaN, not Python None. `value is not None` alone doesn't
+            catch that - NaN is its own object, not None - so int(NaN)
+            was reaching int() and raising ValueError. isinstance(value,
+            float) and value != value is the standard NaN check (NaN is
+            the only float that isn't equal to itself); pd.isna() would
+            also work but this avoids adding a pandas call to a function
+            that otherwise doesn't need one.
+            """
+            if value is None:
+                return None
+            if isinstance(value, float) and value != value:
+                return None
+            return int(value)
+
         for col in columns:
             entry: Dict[str, Any] = {
-                "null_count": int(row.get(f"{col}__nulls"))
-                if row.get(f"{col}__nulls") is not None else None,
-                "distinct_count": int(row.get(f"{col}__distinct"))
-                if row.get(f"{col}__distinct") is not None else None,
+                "null_count": _to_int_or_none(row.get(f"{col}__nulls")),
+                "distinct_count": _to_int_or_none(row.get(f"{col}__distinct")),
                 "min": None,
                 "max": None,
             }

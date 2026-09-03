@@ -146,3 +146,55 @@ def test_get_row_count_without_side_kwarg_is_unaffected_by_filters():
     called_query = fake_spark.sql.call_args[0][0]
     assert "WHERE" not in called_query
     assert "AS filtered" not in called_query
+
+
+# ---------------------------------------------------------------------------
+# get_column_statistics: real user-reported bug - a row_filter that
+# legitimately matches zero rows on one side (e.g. row_filter="gender =
+# 'male'" against a table/filter combination with no matches) still gets
+# exactly one row back from the SUM/COUNT DISTINCT aggregate query (no
+# GROUP BY), but the aggregate values themselves are SQL NULL - which a
+# spark.sql(...).toPandas() round-trip represents as float NaN, not
+# Python None. `value is not None` doesn't catch NaN (it's a different
+# object), so int(NaN) reached int() and raised ValueError, crashing the
+# whole comparison with "ValueError: cannot convert float NaN to integer"
+# instead of reporting a clean SKIPPED/None result for that side.
+# ---------------------------------------------------------------------------
+def test_get_column_statistics_handles_nan_aggregates_without_crashing():
+    fake_spark = MagicMock()
+    fake_spark.sql.return_value.toPandas.return_value = pd.DataFrame(
+        {
+            "id__nulls": [float("nan")],
+            "id__distinct": [float("nan")],
+            "gender__nulls": [float("nan")],
+            "gender__distinct": [float("nan")],
+        }
+    )
+    connector = SparkConnector(spark=fake_spark)
+    connector.set_row_filters(common="gender = 'male'")
+
+    # Must not raise.
+    stats = connector.get_column_statistics("cat", "sch", "tbl", ["id", "gender"])
+
+    assert stats["id"]["null_count"] is None
+    assert stats["id"]["distinct_count"] is None
+    assert stats["gender"]["null_count"] is None
+    assert stats["gender"]["distinct_count"] is None
+
+
+def test_get_column_statistics_still_converts_real_values_to_int():
+    """Regression guard alongside the NaN fix above - a genuine numeric
+    aggregate result must still come back as a real int, not accidentally
+    treated as null-like by the new NaN check."""
+    fake_spark = MagicMock()
+    fake_spark.sql.return_value.toPandas.return_value = pd.DataFrame(
+        {"id__nulls": [0], "id__distinct": [42]}
+    )
+    connector = SparkConnector(spark=fake_spark)
+
+    stats = connector.get_column_statistics("cat", "sch", "tbl", ["id"])
+
+    assert stats["id"]["null_count"] == 0
+    assert stats["id"]["distinct_count"] == 42
+    assert isinstance(stats["id"]["null_count"], int)
+    assert isinstance(stats["id"]["distinct_count"], int)
