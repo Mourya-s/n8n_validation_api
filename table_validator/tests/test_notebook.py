@@ -335,3 +335,76 @@ def test_all_sheet_properties_are_accessible_and_return_result_table():
         assert isinstance(sheet, ResultTable)
         # Must not raise regardless of whether the sheet has rows.
         str(sheet)
+
+
+# ---------------------------------------------------------------------------
+# ResultTable layout: narrow sheets render as one aligned table; sheets
+# whose rendered row would be too wide switch to a vertical, one-field-
+# per-line block per record instead (never truncating/hiding columns).
+# ---------------------------------------------------------------------------
+def test_narrow_sheet_renders_as_single_row_table():
+    from table_validator.notebook import ResultTable
+
+    headers = ["Source Schema", "Source Table", "Overall Status"]
+    rows = [["bronze", "customers", "PASS"], ["bronze", "orders", "FAIL"]]
+    text = str(ResultTable(headers, rows))
+
+    # One line per record (plus the header line) - never split across
+    # multiple lines for a narrow sheet like this.
+    assert text.count("\n") == 2
+    assert "bronze" in text and "customers" in text and "PASS" in text
+    assert "--- Row" not in text
+
+
+def test_wide_sheet_renders_as_vertical_blocks():
+    from table_validator.notebook import ResultTable
+
+    # Mirrors table_validation's real shape: many columns, some holding
+    # long values (an ISO timestamp) - together this exceeds the width
+    # threshold even though most individual values are short.
+    headers = [f"Column {i}" for i in range(24)]
+    row = [f"value_{i}" for i in range(24)]
+    row[-2] = "2026-09-03T09:02:26.853264+00:00"
+    text = str(ResultTable(headers, [row]))
+
+    assert "--- Row 1 of 1 ---" in text
+    for header in headers:
+        assert f"{header}" in text
+    assert "value_0" in text
+    assert "2026-09-03T09:02:26.853264+00:00" in text
+
+
+def test_vertical_blocks_separated_and_numbered_for_multiple_rows():
+    from table_validator.notebook import ResultTable
+
+    headers = [f"Column {i}" for i in range(24)]
+    rows = [[f"value_{i}_{r}" for i in range(24)] for r in range(2)]
+    text = str(ResultTable(headers, rows))
+
+    assert "--- Row 1 of 2 ---" in text
+    assert "--- Row 2 of 2 ---" in text
+    assert "value_0_0" in text
+    assert "value_0_1" in text
+
+
+def test_table_validation_sheet_uses_vertical_layout_for_a_real_row():
+    """Regression test for the real user-reported readability problem:
+    table_validation's 24 columns, once a Validation Timestamp is
+    present, must render as vertical blocks - not one unreadable,
+    sideways-wrapping line."""
+    from table_validator.reports.excel_report import TABLE_HEADERS
+    from table_validator.notebook import ResultTable
+
+    row = [
+        "for_schema_validation", "file_example_xlsx_100_1",
+        "for_schema_validation", "file_example_xlsx_100_1",
+        "FAIL", "FAIL", "SKIPPED", None, None, None,
+        "SKIPPED", "SKIPPED", "SKIPPED", "SKIPPED", "SKIPPED", "SKIPPED",
+        0, "0%", 0, "0%", "SCHEMA_BLOCKED", "",
+        "2026-09-03T09:02:26.853264+00:00", 8.77,
+    ]
+    text = str(ResultTable(TABLE_HEADERS, [row]))
+
+    assert "--- Row 1 of 1 ---" in text
+    assert "Source Schema" in text
+    assert "Overall Status          : FAIL" in text

@@ -124,18 +124,41 @@ def _format_summary_text(data: SummaryData, result: CatalogValidationResponse) -
     return "\n".join(lines)
 
 
+# Past this rendered line width, a one-row-per-record table wraps onto an
+# unreadably wide, sideways-scrolling line in a notebook cell (e.g.
+# table_validation's 24 mostly-short-value columns easily clears 200
+# characters per row) - ResultTable switches to a vertical, one-field-
+# per-line block per record instead once a row would exceed this width,
+# rather than ever truncating/hiding columns (every column stays
+# visible, just laid out top-to-bottom instead of left-to-right). Judged
+# by rendered width rather than a raw column count, since a handful of
+# columns holding long values (e.g. Data Mismatches' Source/Target Value)
+# can be just as unreadable as many columns of short ones, and
+# conversely a wider column count of short values (e.g. Data Mismatches'
+# own 9 columns) can still fit comfortably on one line.
+_MAX_ROW_WIDTH_FOR_ROW_LAYOUT = 180
+
+
 class ResultTable:
     """
     One sheet's worth of rows (mirrors an Excel report sheet - Table
     Validation, Column Validation, Data Mismatches, etc.), printable
-    directly as an aligned plain-text table.
+    directly as plain text.
 
-    Backed by a pandas DataFrame (pandas is already a hard dependency of
-    this package) purely for its to_string() rendering - no rich/box-
-    drawing characters, so it copies cleanly from a notebook cell. Also
-    exposes .rows/.headers for programmatic access, and .to_dataframe()
-    for anyone who wants the real DataFrame (e.g. to filter/sort/export
-    it themselves).
+    A narrow sheet (few columns, e.g. Data Mismatches/Suggestions) renders
+    as one aligned table via pandas' to_string() - no rich/box-drawing
+    characters, so it copies cleanly from a notebook cell. A wide sheet
+    (e.g. Table Validation's 24 columns) would otherwise wrap onto one
+    unreadable, sideways-scrolling line - past
+    _MAX_COLUMNS_FOR_ROW_LAYOUT, it instead renders as one labeled block
+    per record, one "Header: value" line per field, blank line between
+    records - every column stays visible, just top-to-bottom instead of
+    left-to-right.
+
+    Also exposes .rows/.headers for programmatic access, and
+    .to_dataframe() for anyone who wants the real pandas DataFrame (e.g.
+    to filter/sort/export it themselves) regardless of which layout
+    str()/print() chooses.
     """
 
     def __init__(self, headers: List[str], rows: List[List[Any]]) -> None:
@@ -151,12 +174,29 @@ class ResultTable:
     def __repr__(self) -> str:
         return str(self)
 
-    def __str__(self) -> str:
-        if not self.rows:
-            return "(no rows)"
+    def _as_row_table(self) -> str:
         # index=False: a notebook reader has no use for pandas' own
         # synthetic 0..N row index here, only the sheet's real columns.
         return self.to_dataframe().to_string(index=False)
+
+    def _as_vertical_blocks(self) -> str:
+        label_width = max(len(h) for h in self.headers)
+        blocks: List[str] = []
+        for i, row in enumerate(self.rows, start=1):
+            lines = [f"--- Row {i} of {len(self.rows)} ---"]
+            for header, value in zip(self.headers, row):
+                lines.append(f"{header.ljust(label_width)} : {value}")
+            blocks.append("\n".join(lines))
+        return "\n\n".join(blocks)
+
+    def __str__(self) -> str:
+        if not self.rows:
+            return "(no rows)"
+        row_table = self._as_row_table()
+        widest_line = max(len(line) for line in row_table.splitlines())
+        if widest_line > _MAX_ROW_WIDTH_FOR_ROW_LAYOUT:
+            return self._as_vertical_blocks()
+        return row_table
 
 
 class ValidationResult:
