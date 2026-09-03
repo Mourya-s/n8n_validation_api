@@ -282,6 +282,9 @@ def validate_tables(
     only_columns: Optional[List[str]] = None,
     column_map: Optional[Dict[str, str]] = None,
     ignore_datatype_columns: Optional[List[str]] = None,
+    row_filter: Optional[str] = None,
+    source_row_filter: Optional[str] = None,
+    target_row_filter: Optional[str] = None,
 ) -> ValidationResult:
     """
     Validate a source against a target, using the notebook's own ambient
@@ -335,6 +338,23 @@ def validate_tables(
     STRING -> INT) and you only want to check the row/value-level data,
     not re-litigate the type change every run.
 
+    `row_filter`/`source_row_filter`/`target_row_filter`, if given,
+    restrict comparison to only the rows matching a SQL WHERE-clause
+    fragment - e.g. `row_filter="id > 20 and id < 100"` or
+    `row_filter="gender = 'male'"` - instead of the whole table. Row
+    count, statistics, whole-table fingerprint, row-hash diff, and
+    column-level mismatch detail are ALL scoped to just the matching
+    rows on both sides. `row_filter` applies to both sides equally;
+    `source_row_filter`/`target_row_filter` additionally AND onto just
+    that one side (all three can combine - e.g. a common status filter
+    plus a source-only id range). Each fragment is used as-is (wrapped
+    in parentheses for safe AND-combination), not parsed or validated -
+    a malformed fragment surfaces as a normal SQL error the first time a
+    query actually runs, the same as any other SQL text mistake would.
+    Valid in both single-table and schema-wide sweep mode (a sweep
+    filtering every matched table by the same condition, e.g.
+    `gender = 'male'`, is a legitimate use case).
+
     Returns a ValidationResult: `print(result)` alone shows a compact
     plain-text summary (no rich/box-drawing formatting, safe to print
     directly in a notebook cell, and correctly listing every table when
@@ -348,6 +368,10 @@ def validate_tables(
     tgt_catalog, tgt_schema, tgt_table = _parse_source_target(target, "target")
 
     connector = SparkConnector(spark=spark)
+    if row_filter or source_row_filter or target_row_filter:
+        connector.set_row_filters(
+            common=row_filter, source=source_row_filter, target=target_row_filter,
+        )
 
     schema_map: Dict[str, str] = (
         {src_schema: tgt_schema} if src_schema.lower() != tgt_schema.lower() else {}

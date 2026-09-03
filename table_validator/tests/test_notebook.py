@@ -648,3 +648,104 @@ def test_sweep_result_table_validation_sheet_has_one_row_per_matched_table():
     assert len(sheet) == 2
     df = sheet.to_dataframe()
     assert set(df["Source Table"]) == {"customers", "orders"}
+
+
+# ---------------------------------------------------------------------------
+# Row-filter kwargs: row_filter / source_row_filter / target_row_filter.
+# These call connector.set_row_filters(...) - the actual SQL-level effect
+# (via BaseSqlConnector._scoped_table) is covered in
+# test_base_sql_connector.py; here we only verify validate_tables() wires
+# the three kwargs to that call correctly.
+# ---------------------------------------------------------------------------
+def test_row_filter_calls_set_row_filters_with_common_only():
+    fake_connector = MagicMock()
+
+    with patch("table_validator.notebook.SparkConnector", return_value=fake_connector), \
+         patch(
+             "table_validator.notebook.CatalogValidator.compare_catalogs",
+             return_value=_fake_response(),
+         ):
+        validate_tables(
+            "cat1.sch1.t1", "cat1.sch1.t2",
+            row_filter="id > 20 and id < 100", spark=MagicMock(),
+        )
+
+    fake_connector.set_row_filters.assert_called_once_with(
+        common="id > 20 and id < 100", source=None, target=None,
+    )
+
+
+def test_source_and_target_row_filter_call_set_row_filters_correctly():
+    fake_connector = MagicMock()
+
+    with patch("table_validator.notebook.SparkConnector", return_value=fake_connector), \
+         patch(
+             "table_validator.notebook.CatalogValidator.compare_catalogs",
+             return_value=_fake_response(),
+         ):
+        validate_tables(
+            "cat1.sch1.t1", "cat1.sch1.t2",
+            source_row_filter="id > 20", target_row_filter="id > 15",
+            spark=MagicMock(),
+        )
+
+    fake_connector.set_row_filters.assert_called_once_with(
+        common=None, source="id > 20", target="id > 15",
+    )
+
+
+def test_all_three_row_filters_combine_in_one_call():
+    fake_connector = MagicMock()
+
+    with patch("table_validator.notebook.SparkConnector", return_value=fake_connector), \
+         patch(
+             "table_validator.notebook.CatalogValidator.compare_catalogs",
+             return_value=_fake_response(),
+         ):
+        validate_tables(
+            "cat1.sch1.t1", "cat1.sch1.t2",
+            row_filter="status = 'active'",
+            source_row_filter="id > 20", target_row_filter="id > 15",
+            spark=MagicMock(),
+        )
+
+    fake_connector.set_row_filters.assert_called_once_with(
+        common="status = 'active'", source="id > 20", target="id > 15",
+    )
+
+
+def test_no_row_filter_kwargs_never_calls_set_row_filters():
+    """set_row_filters must not be called at all when no filter is given
+    - not even with all-None args - matching the CLI path's own
+    connector, which never touches this mechanism."""
+    fake_connector = MagicMock()
+
+    with patch("table_validator.notebook.SparkConnector", return_value=fake_connector), \
+         patch(
+             "table_validator.notebook.CatalogValidator.compare_catalogs",
+             return_value=_fake_response(),
+         ):
+        validate_tables("cat1.sch1.t1", "cat1.sch1.t2", spark=MagicMock())
+
+    fake_connector.set_row_filters.assert_not_called()
+
+
+def test_row_filter_valid_in_schema_sweep_mode():
+    """Unlike primary_key, a row filter is a legitimate use case in a
+    schema-wide sweep (e.g. filtering every matched table by the same
+    condition) - must not raise."""
+    fake_connector = MagicMock()
+
+    with patch("table_validator.notebook.SparkConnector", return_value=fake_connector), \
+         patch(
+             "table_validator.notebook.CatalogValidator.compare_catalogs",
+             return_value=_fake_sweep_response(),
+         ):
+        validate_tables(
+            "cat1.bronze", "cat1.silver",
+            row_filter="gender = 'male'", spark=MagicMock(),
+        )  # must not raise
+
+    fake_connector.set_row_filters.assert_called_once_with(
+        common="gender = 'male'", source=None, target=None,
+    )

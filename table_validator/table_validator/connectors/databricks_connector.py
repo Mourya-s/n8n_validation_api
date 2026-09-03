@@ -67,6 +67,7 @@ class DatabricksConnector(BaseSqlConnector):
         up. Falls back to the DATABRICKS_RETRY_TIMEOUT_SECONDS environment
         variable, then the connector's own default, if not given.
         """
+        super().__init__()
 
         self._host = host
         self._token = token

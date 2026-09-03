@@ -100,13 +100,88 @@ class BaseSqlConnector:
     only connection lifecycle (__init__/connect/disconnect/
     test_connection) and _execute_to_dataframe - every method below is
     connection-agnostic and works unchanged regardless of how the query
-    text actually gets executed.
+    text actually gets executed. Subclasses must call
+    super().__init__() so the row-filter state below exists.
     """
 
-    def _execute_to_dataframe(self, query: str) -> pd.DataFrame:
-        """The one abstract seam. Concrete subclasses must override this
-        to actually run `query` and return the result as a DataFrame."""
-        raise NotImplementedError
+    def __init__(self) -> None:
+        # Row-filter predicates (raw SQL WHERE-fragment strings), set via
+        # set_row_filters() - notebook.py's validate_tables() is the only
+        # current caller (row_filter/source_row_filter/target_row_filter
+        # kwargs). None (the default for every field) means "no filter,
+        # whole table" - the CLI path never calls set_row_filters, so
+        # every existing caller's behavior is completely unchanged.
+        self._common_row_filter: Optional[str] = None
+        self._source_row_filter: Optional[str] = None
+        self._target_row_filter: Optional[str] = None
+
+    def set_row_filters(
+        self,
+        *,
+        common: Optional[str] = None,
+        source: Optional[str] = None,
+        target: Optional[str] = None,
+    ) -> None:
+        """
+        Restrict every subsequent row-level query on this connector
+        (row count, statistics, fingerprint, row-hash, column-level
+        detail) to rows matching these SQL WHERE-fragment predicates -
+        `common` applies to both sides, `source`/`target` apply
+        additionally (ANDed) to just that side, so all three can combine
+        (e.g. common="status = 'active'" plus source="id > 20" means the
+        source side gets both conditions ANDed, the target side gets
+        only the common one).
+
+        Each fragment is used as-is, parenthesized for safe AND-
+        combination when more than one applies - not parsed or
+        validated in any way; a malformed fragment surfaces as a normal
+        SQL error from the underlying engine the first time a query
+        actually runs, the same way a typo in any other user-supplied
+        SQL text would. This is a notebook-facing convenience for a
+        trusted caller filtering their own comparison, not a public API
+        boundary accepting untrusted input.
+        """
+        self._common_row_filter = common
+        self._source_row_filter = source
+        self._target_row_filter = target
+
+    def _scoped_table(
+        self,
+        catalog: str,
+        schema: str,
+        table: str,
+        side: Optional[str] = None,
+    ) -> str:
+        """
+        Like _qualify(catalog, schema, table), but wraps the result in a
+        filtered subquery when a row filter applies for `side`
+        ("source"/"target"/None - None means "no per-side filter, only
+        the common one if set"). Every existing row-level query already
+        obtains its FROM-clause table reference through exactly one call
+        like this per side, so swapping that one call site is enough to
+        make the whole tiered comparison filter-aware with zero changes
+        to catalog_validator.py's own tier logic.
+
+        Returns _qualify's own output completely unchanged when no
+        filter applies for this call (both `_common_row_filter` and the
+        relevant per-side filter are None) - this is what keeps every
+        existing caller's generated SQL byte-identical to before this
+        feature existed.
+        """
+        qualified = self._qualify(catalog, schema, table)
+
+        conditions = []
+        if self._common_row_filter:
+            conditions.append(f"({self._common_row_filter})")
+        if side == "source" and self._source_row_filter:
+            conditions.append(f"({self._source_row_filter})")
+        elif side == "target" and self._target_row_filter:
+            conditions.append(f"({self._target_row_filter})")
+
+        if not conditions:
+            return qualified
+
+        return f"(SELECT * FROM {qualified} WHERE {' AND '.join(conditions)}) AS filtered"
 
     @staticmethod
     def _quote_ident(identifier: str) -> str:
@@ -358,8 +433,10 @@ class BaseSqlConnector:
         df["is_nullable"] = df["is_nullable"].astype(str).str.upper().eq("YES")
         return df.reset_index(drop=True)
 
-    def get_row_count(self, catalog: str, schema: str, table: str) -> int:
-        query = f"SELECT COUNT(*) AS row_count FROM {self._qualify(catalog, schema, table)}"
+    def get_row_count(
+        self, catalog: str, schema: str, table: str, side: Optional[str] = None,
+    ) -> int:
+        query = f"SELECT COUNT(*) AS row_count FROM {self._scoped_table(catalog, schema, table, side)}"
         try:
             df = self._execute_to_dataframe(query)
         except Exception as exc:
@@ -381,6 +458,7 @@ class BaseSqlConnector:
         table: str,
         columns: Sequence[str],
         min_max_columns: Optional[Sequence[str]] = None,
+        side: Optional[str] = None,
     ) -> Dict[str, Dict[str, Any]]:
         """
         Single aggregate query returning null count, distinct count, and
@@ -406,7 +484,7 @@ class BaseSqlConnector:
 
         query = (
             f"SELECT {', '.join(select_parts)} "
-            f"FROM {self._qualify(catalog, schema, table)}"
+            f"FROM {self._scoped_table(catalog, schema, table, side)}"
         )
 
         try:
@@ -484,6 +562,7 @@ class BaseSqlConnector:
         table: str,
         columns: Sequence[str],
         spec: Optional["HashCanonicalizationSpec"] = None,
+        side: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Tier 2: single order-independent whole-table fingerprint, computed
@@ -508,7 +587,7 @@ class BaseSqlConnector:
                 COUNT(*) AS row_count,
                 SUM(CAST(conv({hash_prefix}, 16, 10) AS DECIMAL(38,0))) AS hash_sum,
                 BIT_XOR(CAST(conv({hash_prefix}, 16, 10) AS BIGINT)) AS hash_xor
-            FROM {self._qualify(catalog, schema, table)}
+            FROM {self._scoped_table(catalog, schema, table, side)}
         """
 
         try:
@@ -541,6 +620,7 @@ class BaseSqlConnector:
         columns: Sequence[str],
         bucket_column: str,
         spec: Optional["HashCanonicalizationSpec"] = None,
+        side: Optional[str] = None,
     ) -> pd.DataFrame:
         """
         Tier 3: the same triple fingerprint as get_table_fingerprint, but
@@ -564,7 +644,7 @@ class BaseSqlConnector:
                 COUNT(*) AS row_count,
                 SUM(CAST(conv({hash_prefix}, 16, 10) AS DECIMAL(38,0))) AS hash_sum,
                 BIT_XOR(CAST(conv({hash_prefix}, 16, 10) AS BIGINT)) AS hash_xor
-            FROM {self._qualify(catalog, schema, table)}
+            FROM {self._scoped_table(catalog, schema, table, side)}
             GROUP BY {bucket_ident}
         """
 
@@ -731,8 +811,8 @@ class BaseSqlConnector:
         if not key_values:
             return []
 
-        src = self._qualify(source_catalog, source_schema or schema, source_table or table)
-        tgt = self._qualify(target_catalog, target_schema or schema, target_table or table)
+        src = self._scoped_table(source_catalog, source_schema or schema, source_table or table, "source")
+        tgt = self._scoped_table(target_catalog, target_schema or schema, target_table or table, "target")
         key_ident = self._quote_ident(key_column)
         quoted_values = ", ".join(f"'{str(v).replace(chr(39), chr(39) * 2)}'" for v in key_values)
         changed_query = (
@@ -878,6 +958,7 @@ class BaseSqlConnector:
         columns: Sequence[str],
         primary_key_cols: Sequence[str],
         bucket_predicate: Optional[Tuple[str, Any]] = None,
+        side: Optional[str] = None,
     ) -> pd.DataFrame:
         """
         Single push-down query returning one deterministic row hash per
@@ -909,7 +990,7 @@ class BaseSqlConnector:
 
         query = f"""
             SELECT {key_list}, {row_hash_expr} AS row_hash
-            FROM {self._qualify(catalog, schema, table)}
+            FROM {self._scoped_table(catalog, schema, table, side)}
             {where_clause}
         """
 
@@ -935,6 +1016,7 @@ class BaseSqlConnector:
         table: str,
         columns: Sequence[str],
         bucket_predicate: Optional[Tuple[str, Any]] = None,
+        side: Optional[str] = None,
     ) -> pd.DataFrame:
         """
         Fallback for tables with no configured primary key: assigns a
@@ -968,7 +1050,7 @@ class BaseSqlConnector:
             SELECT
                 ROW_NUMBER() OVER (ORDER BY {order_by}) AS row_number,
                 {row_hash_expr} AS row_hash
-            FROM {self._qualify(catalog, schema, table)}
+            FROM {self._scoped_table(catalog, schema, table, side)}
             {where_clause}
         """
 
@@ -1061,8 +1143,8 @@ class BaseSqlConnector:
         target_value_columns = list(target_value_columns or value_columns)
         source_to_target = dict(zip(value_columns, target_value_columns))
 
-        src = self._qualify(source_catalog, source_schema or schema, source_table or table)
-        tgt = self._qualify(target_catalog, target_schema or schema, target_table or table)
+        src = self._scoped_table(source_catalog, source_schema or schema, source_table or table, "source")
+        tgt = self._scoped_table(target_catalog, target_schema or schema, target_table or table, "target")
         source_order_by = ", ".join(self._quote_ident(c) for c in order_by_columns)
         target_order_by = ", ".join(self._quote_ident(c) for c in target_order_by_columns)
         source_value_idents = [self._quote_ident(c) for c in value_columns]

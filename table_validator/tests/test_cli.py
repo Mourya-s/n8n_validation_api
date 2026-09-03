@@ -124,14 +124,14 @@ def _mock_databricks_connector() -> MagicMock:
     }
     mock.is_min_max_eligible.side_effect = lambda dt: dt.lower().startswith("int")
     mock.get_row_hashes_by_row_number.side_effect = (
-        lambda catalog, schema, table, cols, bucket_predicate=None: pd.DataFrame(
+        lambda catalog, schema, table, cols, bucket_predicate=None, **_: pd.DataFrame(
             [{"row_number": 1, "row_hash": "aaa"}, {"row_number": 2, "row_hash": "bbb"}]
         )
     )
     # Fingerprint disagrees between source/target so the tiered funnel
     # (Tier 0 -> 1 -> 2 -> 4) proceeds all the way to the row-hash stage,
     # matching this fixture's pre-existing "reaches row-hash" behavior.
-    mock.get_table_fingerprint.side_effect = lambda catalog, schema, table, columns, spec=None: (
+    mock.get_table_fingerprint.side_effect = lambda catalog, schema, table, columns, spec=None, **_: (
         {"row_count": 10, "hash_sum": 111, "hash_xor": 222}
         if catalog == "src_cat"
         else {"row_count": 10, "hash_sum": 999, "hash_xor": 888}

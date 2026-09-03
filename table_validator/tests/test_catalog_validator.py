@@ -61,7 +61,7 @@ def _make_connector(**overrides) -> MagicMock:
     mock.get_table_fingerprint.return_value = {
         "row_count": 100, "hash_sum": 12345, "hash_xor": 67890,
     }
-    mock.get_row_hashes_by_row_number.side_effect = lambda catalog, schema, table, cols, bucket_predicate=None: (
+    mock.get_row_hashes_by_row_number.side_effect = lambda catalog, schema, table, cols, bucket_predicate=None, **_: (
         _hash_df([(1, "aaa"), (2, "bbb")], key="row_number")
     )
     for key, value in overrides.items():
@@ -73,7 +73,7 @@ def _mismatched_fingerprint_connector(**overrides) -> MagicMock:
     """A connector fixture whose fingerprint always disagrees between
     source and target, forcing the funnel past Tier 2 into Tier 4 - for
     tests that need to exercise row-hash diff logic."""
-    def fingerprint_side_effect(catalog, schema, table, columns, spec=None):
+    def fingerprint_side_effect(catalog, schema, table, columns, spec=None, **_):
         return (
             {"row_count": 100, "hash_sum": 111, "hash_xor": 222}
             if catalog == "cat_source"
@@ -205,7 +205,7 @@ def test_explicit_schema_scope_excludes_unrelated_missing_and_extra_schemas():
 # ---------------------------------------------------------------------------
 def test_missing_column_detected():
     connector = _make_connector()
-    connector.get_table_schema.side_effect = lambda catalog, schema, table: (
+    connector.get_table_schema.side_effect = lambda catalog, schema, table, **_: (
         _schema_df([("id", "int", False), ("age", "int", True)])
         if catalog == "cat_source"
         else _schema_df([("id", "int", False)])
@@ -230,7 +230,7 @@ def test_missing_column_detected():
 
 def test_extra_column_detected():
     connector = _make_connector()
-    connector.get_table_schema.side_effect = lambda catalog, schema, table: (
+    connector.get_table_schema.side_effect = lambda catalog, schema, table, **_: (
         _schema_df([("id", "int", False)])
         if catalog == "cat_source"
         else _schema_df([("id", "int", False), ("phone", "string", True)])
@@ -258,7 +258,7 @@ def test_extra_column_detected():
 # ---------------------------------------------------------------------------
 def test_datatype_widening_within_family_is_non_blocking():
     connector = _make_connector()
-    connector.get_table_schema.side_effect = lambda catalog, schema, table: (
+    connector.get_table_schema.side_effect = lambda catalog, schema, table, **_: (
         _schema_df([("age", "int", True)])
         if catalog == "cat_source"
         else _schema_df([("age", "bigint", True)])
@@ -284,7 +284,7 @@ def test_datatype_widening_within_family_is_non_blocking():
 
 def test_datatype_cross_family_change_is_blocking():
     connector = _make_connector()
-    connector.get_table_schema.side_effect = lambda catalog, schema, table: (
+    connector.get_table_schema.side_effect = lambda catalog, schema, table, **_: (
         _schema_df([("age", "int", True)])
         if catalog == "cat_source"
         else _schema_df([("age", "string", True)])
@@ -313,7 +313,7 @@ def test_nullable_mismatch_detected():
     spec's explicit acceptance criterion: reported as a schema mismatch,
     but the funnel still verifies row-level data on its own)."""
     connector = _make_connector()
-    connector.get_table_schema.side_effect = lambda catalog, schema, table: (
+    connector.get_table_schema.side_effect = lambda catalog, schema, table, **_: (
         _schema_df([("id", "int", False)])
         if catalog == "cat_source"
         else _schema_df([("id", "int", True)])
@@ -335,7 +335,7 @@ def test_nullable_mismatch_detected():
 
 def test_nullable_check_can_be_disabled():
     connector = _make_connector()
-    connector.get_table_schema.side_effect = lambda catalog, schema, table: (
+    connector.get_table_schema.side_effect = lambda catalog, schema, table, **_: (
         _schema_df([("id", "int", False)])
         if catalog == "cat_source"
         else _schema_df([("id", "int", True)])
@@ -356,7 +356,7 @@ def test_nullable_check_can_be_disabled():
 # ---------------------------------------------------------------------------
 def test_column_order_mismatch_detected_when_enabled():
     connector = _make_connector()
-    connector.get_table_schema.side_effect = lambda catalog, schema, table: (
+    connector.get_table_schema.side_effect = lambda catalog, schema, table, **_: (
         _schema_df([("id", "int", False), ("name", "string", True), ("age", "int", True)])
         if catalog == "cat_source"
         else _schema_df([("id", "int", False), ("age", "int", True), ("name", "string", True)])
@@ -375,7 +375,7 @@ def test_column_order_mismatch_detected_when_enabled():
 
 def test_column_order_ignored_when_disabled():
     connector = _make_connector()
-    connector.get_table_schema.side_effect = lambda catalog, schema, table: (
+    connector.get_table_schema.side_effect = lambda catalog, schema, table, **_: (
         _schema_df([("id", "int", False), ("name", "string", True)])
         if catalog == "cat_source"
         else _schema_df([("name", "string", True), ("id", "int", False)])
@@ -399,7 +399,7 @@ def test_column_order_ignored_when_disabled():
 # ---------------------------------------------------------------------------
 def test_row_count_mismatch_detected():
     connector = _mismatched_fingerprint_connector()
-    connector.get_row_count.side_effect = lambda catalog, schema, table: (
+    connector.get_row_count.side_effect = lambda catalog, schema, table, **_: (
         1000 if catalog == "cat_source" else 950
     )
     validator = CatalogValidator(connector)
@@ -423,7 +423,7 @@ def test_row_count_mismatch_detected():
 # ---------------------------------------------------------------------------
 def test_null_count_mismatch_detected():
     connector = _make_connector()
-    connector.get_column_statistics.side_effect = lambda catalog, schema, table, cols, mm: (
+    connector.get_column_statistics.side_effect = lambda catalog, schema, table, cols, mm, **_: (
         {"id": {"null_count": 0, "distinct_count": 100, "min": None, "max": None},
          "name": {"null_count": 100, "distinct_count": 90, "min": None, "max": None}}
         if catalog == "cat_source"
@@ -446,7 +446,7 @@ def test_null_count_mismatch_detected():
 # ---------------------------------------------------------------------------
 def test_distinct_count_mismatch_detected():
     connector = _make_connector()
-    connector.get_column_statistics.side_effect = lambda catalog, schema, table, cols, mm: (
+    connector.get_column_statistics.side_effect = lambda catalog, schema, table, cols, mm, **_: (
         {"id": {"null_count": 0, "distinct_count": 15, "min": None, "max": None},
          "name": {"null_count": 0, "distinct_count": 15, "min": None, "max": None}}
         if catalog == "cat_source"
@@ -469,7 +469,7 @@ def test_min_max_mismatch_detected_for_eligible_columns():
     connector = _make_connector()
     connector.get_table_schema.return_value = _schema_df([("amount", "int", True)])
     connector.is_min_max_eligible.return_value = True
-    connector.get_column_statistics.side_effect = lambda catalog, schema, table, cols, mm: (
+    connector.get_column_statistics.side_effect = lambda catalog, schema, table, cols, mm, **_: (
         {"amount": {"null_count": 0, "distinct_count": 5, "min": 10, "max": 50000}}
         if catalog == "cat_source"
         else
@@ -501,7 +501,7 @@ def test_fully_matching_table_passes():
 
 def test_failed_table_marks_overall_catalog_as_fail():
     connector = _make_connector()
-    connector.get_row_count.side_effect = lambda catalog, schema, table: (
+    connector.get_row_count.side_effect = lambda catalog, schema, table, **_: (
         100 if catalog == "cat_source" else 90
     )
     validator = CatalogValidator(connector)
@@ -698,13 +698,13 @@ def test_matching_bucket_is_never_row_hash_scanned():
         [("east", 1_000_000, 111, 222), ("west", 1_000_000, 111, 222)]
     )
 
-    def fingerprint_by_bucket_side_effect(catalog, schema, table, columns, bucket_column):
+    def fingerprint_by_bucket_side_effect(catalog, schema, table, columns, bucket_column, **_):
         if catalog == "cat_source":
             return _bucket_fingerprint_df([("east", 1_000_000, 111, 222), ("west", 1_000_000, 333, 444)])
         return _bucket_fingerprint_df([("east", 1_000_000, 111, 222), ("west", 1_000_000, 999, 888)])
 
     connector.get_table_fingerprint_by_bucket.side_effect = fingerprint_by_bucket_side_effect
-    connector.get_row_hashes_by_row_number.side_effect = lambda catalog, schema, table, cols, bucket_predicate=None: (
+    connector.get_row_hashes_by_row_number.side_effect = lambda catalog, schema, table, cols, bucket_predicate=None, **_: (
         _hash_df([(1, "aaa")], key="row_number")
     )
     prompt = MagicMock(return_value="region")
@@ -820,7 +820,7 @@ def test_tier1_mismatch_drills_down_to_exact_row_in_full_mode():
     into Tier 2/4/5 so the exact differing row lands in
     sample_changed_detail, not just a bare statistic."""
     connector = _mismatched_fingerprint_connector()
-    connector.get_column_statistics.side_effect = lambda catalog, schema, table, cols, mm: (
+    connector.get_column_statistics.side_effect = lambda catalog, schema, table, cols, mm, **_: (
         {"id": {"null_count": 0, "distinct_count": 100, "min": None, "max": None},
          "name": {"null_count": 2, "distinct_count": 21, "min": None, "max": None}}
         if catalog == "cat_source"
@@ -828,7 +828,7 @@ def test_tier1_mismatch_drills_down_to_exact_row_in_full_mode():
         {"id": {"null_count": 0, "distinct_count": 100, "min": None, "max": None},
          "name": {"null_count": 2, "distinct_count": 22, "min": None, "max": None}}
     )
-    connector.get_row_hashes.side_effect = lambda catalog, schema, table, cols, pk, bucket_predicate=None: (
+    connector.get_row_hashes.side_effect = lambda catalog, schema, table, cols, pk, bucket_predicate=None, **_: (
         _hash_df([(1, "aaa"), (2, "bbb")])
         if catalog == "cat_source"
         else _hash_df([(1, "aaa"), (2, "zzz")])
@@ -876,7 +876,7 @@ def test_tier1_mismatch_stays_fail_even_if_fingerprint_and_row_hash_find_nothing
     silently overridden by a downstream tier that simply didn't detect
     the same difference through a different lens."""
     connector = _make_connector()
-    connector.get_column_statistics.side_effect = lambda catalog, schema, table, cols, mm: (
+    connector.get_column_statistics.side_effect = lambda catalog, schema, table, cols, mm, **_: (
         {"id": {"null_count": 0, "distinct_count": 100, "min": None, "max": None},
          "name": {"null_count": 2, "distinct_count": 95, "min": None, "max": None}}
         if catalog == "cat_source"
@@ -917,7 +917,7 @@ def test_row_hashes_matching_produces_no_mismatch():
     # Fingerprint mismatched (forces Tier 4 to run) but the actual
     # per-key row hashes match - Tier 4 itself must report PASS.
     connector = _mismatched_fingerprint_connector()
-    connector.get_row_hashes.side_effect = lambda catalog, schema, table, cols, pk, bucket_predicate=None: (
+    connector.get_row_hashes.side_effect = lambda catalog, schema, table, cols, pk, bucket_predicate=None, **_: (
         _hash_df([(1, "aaa"), (2, "bbb")])
     )
     validator = CatalogValidator(connector)
@@ -935,7 +935,7 @@ def test_row_hashes_matching_produces_no_mismatch():
 
 def test_row_hashes_differing_for_shared_key_is_mismatch():
     connector = _mismatched_fingerprint_connector()
-    connector.get_row_hashes.side_effect = lambda catalog, schema, table, cols, pk, bucket_predicate=None: (
+    connector.get_row_hashes.side_effect = lambda catalog, schema, table, cols, pk, bucket_predicate=None, **_: (
         _hash_df([(1, "aaa"), (2, "bbb")])
         if catalog == "cat_source"
         else _hash_df([(1, "aaa"), (2, "zzz")])
@@ -964,7 +964,7 @@ def test_tier5_column_diff_runs_for_mismatched_key_and_names_exact_column():
     changed cell in a large table is found down to exact PK/column/values"
     from the tiered-funnel spec."""
     connector = _mismatched_fingerprint_connector()
-    connector.get_row_hashes.side_effect = lambda catalog, schema, table, cols, pk, bucket_predicate=None: (
+    connector.get_row_hashes.side_effect = lambda catalog, schema, table, cols, pk, bucket_predicate=None, **_: (
         _hash_df([(1, "aaa"), (2, "bbb")])
         if catalog == "cat_source"
         else _hash_df([(1, "aaa"), (2, "zzz")])
@@ -1011,7 +1011,7 @@ def test_primary_key_lookup_is_case_insensitive_against_catalog_metadata():
     silently miss it and fall through to the much slower ROW_NUMBER()
     fallback instead of using the real configured key."""
     connector = _mismatched_fingerprint_connector()
-    connector.get_row_hashes.side_effect = lambda catalog, schema, table, cols, pk, bucket_predicate=None: (
+    connector.get_row_hashes.side_effect = lambda catalog, schema, table, cols, pk, bucket_predicate=None, **_: (
         _hash_df([(1, "aaa"), (2, "bbb")])
         if catalog == "cat_source"
         else _hash_df([(1, "aaa"), (2, "zzz")])
@@ -1049,7 +1049,7 @@ def test_tier5_column_diff_runs_for_row_number_fallback_when_mismatched():
     no real key - show it, but flag it as unverified)."""
     connector = _mismatched_fingerprint_connector()
     connector.get_row_hashes_by_row_number.side_effect = (
-        lambda catalog, schema, table, cols, bucket_predicate=None: (
+        lambda catalog, schema, table, cols, bucket_predicate=None, **_: (
             _hash_df([(1, "aaa"), (2, "bbb")], key="row_number")
             if catalog == "cat_source"
             else _hash_df([(1, "aaa"), (2, "zzz")], key="row_number")
@@ -1102,7 +1102,7 @@ def test_tier5_row_number_fallback_passes_independent_source_and_target_table_na
         ["old_name"] if catalog == "cat_source" else ["new_name"]
     )
     connector.get_row_hashes_by_row_number.side_effect = (
-        lambda catalog, schema, table, cols, bucket_predicate=None: (
+        lambda catalog, schema, table, cols, bucket_predicate=None, **_: (
             _hash_df([(1, "aaa"), (2, "bbb")], key="row_number")
             if catalog == "cat_source"
             else _hash_df([(1, "aaa"), (2, "zzz")], key="row_number")
@@ -1142,7 +1142,7 @@ def test_tier5_row_number_fallback_error_is_recorded_not_raised():
     same try/except contract as the real-key Tier 5 path."""
     connector = _mismatched_fingerprint_connector()
     connector.get_row_hashes_by_row_number.side_effect = (
-        lambda catalog, schema, table, cols, bucket_predicate=None: (
+        lambda catalog, schema, table, cols, bucket_predicate=None, **_: (
             _hash_df([(1, "aaa"), (2, "bbb")], key="row_number")
             if catalog == "cat_source"
             else _hash_df([(1, "aaa"), (2, "zzz")], key="row_number")
@@ -1161,7 +1161,7 @@ def test_tier5_row_number_fallback_error_is_recorded_not_raised():
 
 def test_row_hashes_key_missing_from_target():
     connector = _mismatched_fingerprint_connector()
-    connector.get_row_hashes.side_effect = lambda catalog, schema, table, cols, pk, bucket_predicate=None: (
+    connector.get_row_hashes.side_effect = lambda catalog, schema, table, cols, pk, bucket_predicate=None, **_: (
         _hash_df([(1, "aaa"), (2, "bbb")])
         if catalog == "cat_source"
         else _hash_df([(1, "aaa")])
@@ -1184,7 +1184,7 @@ def test_row_hashes_key_missing_from_target():
 
 def test_row_hashes_key_missing_from_source():
     connector = _mismatched_fingerprint_connector()
-    connector.get_row_hashes.side_effect = lambda catalog, schema, table, cols, pk, bucket_predicate=None: (
+    connector.get_row_hashes.side_effect = lambda catalog, schema, table, cols, pk, bucket_predicate=None, **_: (
         _hash_df([(1, "aaa")])
         if catalog == "cat_source"
         else _hash_df([(1, "aaa"), (2, "bbb")])
@@ -1411,7 +1411,7 @@ def test_column_type_mismatch_does_not_fail_table_when_column_deselected():
     """A real column-level discrepancy (data type mismatch) must not
     affect overall table status when COLUMN wasn't selected to run."""
     connector = _make_connector()
-    connector.get_table_schema.side_effect = lambda catalog, schema, table: (
+    connector.get_table_schema.side_effect = lambda catalog, schema, table, **_: (
         _schema_df([("id", "int", False)])
         if catalog == "cat_source"
         else _schema_df([("id", "bigint", False)])  # type mismatch
@@ -1824,7 +1824,7 @@ def test_ignore_datatype_columns_reports_skipped_not_fail():
     across a type family (e.g. string vs int - normally BLOCKING) must
     report SKIPPED, never FAIL, and must not abort the table."""
     connector = _make_connector()
-    connector.get_table_schema.side_effect = lambda catalog, schema, table: (
+    connector.get_table_schema.side_effect = lambda catalog, schema, table, **_: (
         _schema_df([("id", "int", False), ("legacy_flag", "string", True)])
         if catalog == "cat_source"
         else _schema_df([("id", "int", False), ("legacy_flag", "int", True)])
@@ -1854,7 +1854,7 @@ def test_ignore_datatype_columns_does_not_affect_unlisted_columns():
     ignore_datatype_columns still BLOCKS the table as before - the new
     field only suppresses the columns explicitly named."""
     connector = _make_connector()
-    connector.get_table_schema.side_effect = lambda catalog, schema, table: (
+    connector.get_table_schema.side_effect = lambda catalog, schema, table, **_: (
         _schema_df([("id", "int", False), ("name", "string", True)])
         if catalog == "cat_source"
         else _schema_df([("id", "int", False), ("name", "int", True)])
@@ -1881,7 +1881,7 @@ def test_column_map_treats_renamed_pair_as_common_column():
     as one common column even though compare_columns' plain name
     intersection would classify it as missing (source) + extra (target)."""
     connector = _make_connector()
-    connector.get_table_schema.side_effect = lambda catalog, schema, table: (
+    connector.get_table_schema.side_effect = lambda catalog, schema, table, **_: (
         _schema_df([("id", "int", False), ("cust_id", "int", False), ("name", "string", True)])
         if catalog == "cat_source"
         else _schema_df([("id", "int", False), ("customer_id", "int", False), ("name", "string", True)])
@@ -1941,7 +1941,7 @@ def test_column_map_precedence_ignore_columns_wins_over_mapped_pair():
     """ignore_columns must still win over a column_map entry, checked
     against either side's spelling."""
     connector = _make_connector()
-    connector.get_table_schema.side_effect = lambda catalog, schema, table: (
+    connector.get_table_schema.side_effect = lambda catalog, schema, table, **_: (
         _schema_df([("id", "int", False), ("cust_id", "int", False)])
         if catalog == "cat_source"
         else _schema_df([("id", "int", False), ("customer_id", "int", False)])
@@ -1966,7 +1966,7 @@ def test_column_map_precedence_only_columns_filters_by_canonical_name():
     so a mapped column must be named by its NEW spelling to survive the
     allowlist."""
     connector = _make_connector()
-    connector.get_table_schema.side_effect = lambda catalog, schema, table: (
+    connector.get_table_schema.side_effect = lambda catalog, schema, table, **_: (
         _schema_df([("id", "int", False), ("cust_id", "int", False), ("name", "string", True)])
         if catalog == "cat_source"
         else _schema_df([("id", "int", False), ("customer_id", "int", False), ("name", "string", True)])
@@ -1993,7 +1993,7 @@ def test_column_map_precedence_ignore_datatype_checked_both_spellings():
     user typed - the mapped-from (source) name or the canonical
     (target) name."""
     connector = _make_connector()
-    connector.get_table_schema.side_effect = lambda catalog, schema, table: (
+    connector.get_table_schema.side_effect = lambda catalog, schema, table, **_: (
         _schema_df([("id", "int", False), ("legacy_flag", "string", True)])
         if catalog == "cat_source"
         else _schema_df([("id", "int", False), ("new_flag", "int", True)])
@@ -2040,14 +2040,14 @@ def test_column_map_statistics_queried_with_each_sides_own_column_names():
     the source-catalog call and the TARGET-side name for the
     target-catalog call - never one shared list reused for both."""
     connector = _make_connector()
-    connector.get_table_schema.side_effect = lambda catalog, schema, table: (
+    connector.get_table_schema.side_effect = lambda catalog, schema, table, **_: (
         _schema_df([("id", "int", False), ("cust_id", "int", False)])
         if catalog == "cat_source"
         else _schema_df([("id", "int", False), ("customer_id", "int", False)])
     )
     calls = []
 
-    def fake_get_column_statistics(catalog, schema, table, columns, min_max_columns):
+    def fake_get_column_statistics(catalog, schema, table, columns, min_max_columns, **_):
         calls.append((catalog, list(columns)))
         return {c: {"null_count": 0, "distinct_count": 10, "min": None, "max": None} for c in columns}
 
@@ -2069,12 +2069,12 @@ def test_column_map_statistics_merge_by_position_not_shared_key():
     that pair's OWN source-side and target-side stats - not accidentally
     read another column's stats through a shared-string-key collision."""
     connector = _make_connector()
-    connector.get_table_schema.side_effect = lambda catalog, schema, table: (
+    connector.get_table_schema.side_effect = lambda catalog, schema, table, **_: (
         _schema_df([("id", "int", False), ("cust_id", "int", False)])
         if catalog == "cat_source"
         else _schema_df([("id", "int", False), ("customer_id", "int", False)])
     )
-    connector.get_column_statistics.side_effect = lambda catalog, schema, table, columns, min_max_columns: (
+    connector.get_column_statistics.side_effect = lambda catalog, schema, table, columns, min_max_columns, **_: (
         {
             "id": {"null_count": 0, "distinct_count": 10, "min": None, "max": None},
             "cust_id": {"null_count": 3, "distinct_count": 7, "min": None, "max": None},
@@ -2110,12 +2110,12 @@ def test_column_map_statistics_positional_alignment_survives_alphabetical_reorde
     # Target: 'amount' > 'z_customer_identifier' alphabetically - if
     # either side were re-sorted independently by its own spelling, the
     # merge would misalign 'amount' with the wrong stats.
-    connector.get_table_schema.side_effect = lambda catalog, schema, table: (
+    connector.get_table_schema.side_effect = lambda catalog, schema, table, **_: (
         _schema_df([("amount", "int", False), ("cust_id", "int", False)])
         if catalog == "cat_source"
         else _schema_df([("amount", "int", False), ("z_customer_identifier", "int", False)])
     )
-    connector.get_column_statistics.side_effect = lambda catalog, schema, table, columns, min_max_columns: (
+    connector.get_column_statistics.side_effect = lambda catalog, schema, table, columns, min_max_columns, **_: (
         {
             "amount": {"null_count": 1, "distinct_count": 50, "min": 0, "max": 100},
             "cust_id": {"null_count": 9, "distinct_count": 5, "min": 1, "max": 5},
@@ -2151,7 +2151,7 @@ def test_column_map_min_max_eligibility_uses_source_side_data_type():
     type (as today, unchanged) - confirm this still works correctly when
     the source and target spellings differ."""
     connector = _make_connector()
-    connector.get_table_schema.side_effect = lambda catalog, schema, table: (
+    connector.get_table_schema.side_effect = lambda catalog, schema, table, **_: (
         _schema_df([("id", "int", False), ("cust_id", "int", False)])
         if catalog == "cat_source"
         else _schema_df([("id", "int", False), ("customer_id", "int", False)])
@@ -2184,14 +2184,14 @@ def test_column_map_fingerprint_queries_each_side_with_its_own_column_names():
     the source-catalog call and the TARGET-side name for the
     target-catalog call - never one shared list reused for both."""
     connector = _make_connector()
-    connector.get_table_schema.side_effect = lambda catalog, schema, table: (
+    connector.get_table_schema.side_effect = lambda catalog, schema, table, **_: (
         _schema_df([("id", "int", False), ("cust_id", "int", False)])
         if catalog == "cat_source"
         else _schema_df([("id", "int", False), ("customer_id", "int", False)])
     )
     calls = []
 
-    def fake_get_table_fingerprint(catalog, schema, table, columns):
+    def fake_get_table_fingerprint(catalog, schema, table, columns, **_):
         calls.append((catalog, list(columns)))
         return {"row_count": 5, "hash_sum": 1, "hash_xor": 1}
 
@@ -2217,14 +2217,14 @@ def test_column_map_row_hash_queried_with_each_sides_own_column_names():
     names for the source-catalog call and TARGET-side names for the
     target-catalog call."""
     connector = _mismatched_fingerprint_connector()
-    connector.get_table_schema.side_effect = lambda catalog, schema, table: (
+    connector.get_table_schema.side_effect = lambda catalog, schema, table, **_: (
         _schema_df([("id", "int", False), ("cust_id", "int", False)])
         if catalog == "cat_source"
         else _schema_df([("id", "int", False), ("customer_id", "int", False)])
     )
     calls = []
 
-    def fake_get_row_hashes(catalog, schema, table, columns, pk, bucket_predicate=None):
+    def fake_get_row_hashes(catalog, schema, table, columns, pk, bucket_predicate=None, **_):
         calls.append((catalog, list(columns)))
         return _hash_df([(1, "aaa"), (2, "bbb")])
 
@@ -2248,14 +2248,14 @@ def test_column_map_row_number_fallback_queried_with_each_sides_own_column_names
     """No primary key configured -> get_row_hashes_by_row_number must
     also use each side's own column spelling, same positional order."""
     connector = _mismatched_fingerprint_connector()
-    connector.get_table_schema.side_effect = lambda catalog, schema, table: (
+    connector.get_table_schema.side_effect = lambda catalog, schema, table, **_: (
         _schema_df([("id", "int", False), ("cust_id", "int", False)])
         if catalog == "cat_source"
         else _schema_df([("id", "int", False), ("customer_id", "int", False)])
     )
     calls = []
 
-    def fake_get_row_hashes_by_row_number(catalog, schema, table, columns, bucket_predicate=None):
+    def fake_get_row_hashes_by_row_number(catalog, schema, table, columns, bucket_predicate=None, **_):
         calls.append((catalog, list(columns)))
         return _hash_df([(1, "aaa"), (2, "bbb")], key="row_number")
 
@@ -2279,7 +2279,7 @@ def test_column_map_primary_key_collision_produces_clear_error():
     must produce a clear, visible error - never silently query the
     wrong name on one side."""
     connector = _make_connector()
-    connector.get_table_schema.side_effect = lambda catalog, schema, table: (
+    connector.get_table_schema.side_effect = lambda catalog, schema, table, **_: (
         _schema_df([("cust_id", "int", False), ("name", "string", True)])
         if catalog == "cat_source"
         else _schema_df([("customer_id", "int", False), ("name", "string", True)])
@@ -2308,12 +2308,12 @@ def test_column_map_tier5_column_diff_shows_both_column_names():
     reported with the canonical (target) name in mismatch_column and the
     original (source) name in source_mismatch_column."""
     connector = _mismatched_fingerprint_connector()
-    connector.get_table_schema.side_effect = lambda catalog, schema, table: (
+    connector.get_table_schema.side_effect = lambda catalog, schema, table, **_: (
         _schema_df([("id", "int", False), ("cust_id", "int", False)])
         if catalog == "cat_source"
         else _schema_df([("id", "int", False), ("customer_id", "int", False)])
     )
-    connector.get_row_hashes.side_effect = lambda catalog, schema, table, cols, pk, bucket_predicate=None: (
+    connector.get_row_hashes.side_effect = lambda catalog, schema, table, cols, pk, bucket_predicate=None, **_: (
         _hash_df([(1, "aaa"), (2, "bbb")])
         if catalog == "cat_source"
         else _hash_df([(1, "aaa"), (2, "zzz")])
@@ -2357,12 +2357,12 @@ def test_column_map_tier5_row_number_fallback_shows_both_column_names():
     per-side order-by/value-column lists, and the resulting detail must
     show both column names."""
     connector = _mismatched_fingerprint_connector()
-    connector.get_table_schema.side_effect = lambda catalog, schema, table: (
+    connector.get_table_schema.side_effect = lambda catalog, schema, table, **_: (
         _schema_df([("id", "int", False), ("cust_id", "int", False)])
         if catalog == "cat_source"
         else _schema_df([("id", "int", False), ("customer_id", "int", False)])
     )
-    connector.get_row_hashes_by_row_number.side_effect = lambda catalog, schema, table, cols, bucket_predicate=None: (
+    connector.get_row_hashes_by_row_number.side_effect = lambda catalog, schema, table, cols, bucket_predicate=None, **_: (
         _hash_df([(1, "aaa"), (2, "bbb")], key="row_number")
         if catalog == "cat_source"
         else _hash_df([(1, "aaa"), (2, "zzz")], key="row_number")
@@ -2429,7 +2429,7 @@ def test_column_map_resolves_cleanly_for_mixed_case_column_names():
     leave a stale, wrong-cased entry in missing_columns/extra_columns
     that permanently BLOCKS the table."""
     connector = _make_connector()
-    connector.get_table_schema.side_effect = lambda catalog, schema, table: (
+    connector.get_table_schema.side_effect = lambda catalog, schema, table, **_: (
         _schema_df([("Id", "int", False), ("Gender", "string", True)])
         if catalog == "cat_source"
         else _schema_df([("Id", "int", False), ("Gender_1", "string", True)])

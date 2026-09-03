@@ -1342,10 +1342,10 @@ class CatalogValidator:
         # Row count (also serves stage "row_count_status" as before).
         try:
             src_count = self.databricks.get_row_count(
-                request.source_catalog, source_schema, source_table
+                request.source_catalog, source_schema, source_table, side="source"
             )
             tgt_count = self.databricks.get_row_count(
-                request.target_catalog, target_schema, target_table
+                request.target_catalog, target_schema, target_table, side="target"
             )
             result.row_count_source = src_count
             result.row_count_target = tgt_count
@@ -1383,10 +1383,12 @@ class CatalogValidator:
             source_stats = self.databricks.get_column_statistics(
                 request.source_catalog, source_schema, source_table,
                 source_names, [src for src, _tgt in min_max_pairs],
+                side="source",
             )
             target_stats = self.databricks.get_column_statistics(
                 request.target_catalog, target_schema, target_table,
                 target_names, [tgt for _src, tgt in min_max_pairs],
+                side="target",
             )
             stats_error = None
         except Exception as exc:
@@ -1511,9 +1513,11 @@ class CatalogValidator:
         try:
             source_fp = self.databricks.get_table_fingerprint(
                 request.source_catalog, source_schema, source_table, source_names,
+                side="source",
             )
             target_fp = self.databricks.get_table_fingerprint(
                 request.target_catalog, target_schema, target_table, target_names,
+                side="target",
             )
         except Exception as exc:
             logger.exception(
@@ -1703,9 +1707,11 @@ class CatalogValidator:
         try:
             source_buckets = self.databricks.get_table_fingerprint_by_bucket(
                 request.source_catalog, source_schema, source_table, source_names, bucket_column,
+                side="source",
             )
             target_buckets = self.databricks.get_table_fingerprint_by_bucket(
                 request.target_catalog, target_schema, target_table, target_names, bucket_column,
+                side="target",
             )
         except Exception as exc:
             logger.exception(
@@ -2293,11 +2299,11 @@ class CatalogValidator:
 
         source_hashes = self.databricks.get_row_hashes(
             request.source_catalog, source_schema, source_table, source_value_names, key_columns,
-            bucket_predicate=bucket_predicate,
+            bucket_predicate=bucket_predicate, side="source",
         )
         target_hashes = self.databricks.get_row_hashes(
             request.target_catalog, target_schema, target_table, target_value_names, key_columns,
-            bucket_predicate=bucket_predicate,
+            bucket_predicate=bucket_predicate, side="target",
         )
 
         logger.info(
@@ -2336,11 +2342,11 @@ class CatalogValidator:
 
         source_hashes = self.databricks.get_row_hashes_by_row_number(
             request.source_catalog, source_schema, source_table, source_names,
-            bucket_predicate=bucket_predicate,
+            bucket_predicate=bucket_predicate, side="source",
         )
         target_hashes = self.databricks.get_row_hashes_by_row_number(
             request.target_catalog, target_schema, target_table, target_names,
-            bucket_predicate=bucket_predicate,
+            bucket_predicate=bucket_predicate, side="target",
         )
 
         logger.info(

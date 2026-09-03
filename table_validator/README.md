@@ -166,6 +166,42 @@ table in the sweep) - compare one table at a time
 (`"catalog.schema.table"` on both sides) if you need row-level detail via
 a real key.
 
+### Row filtering (compare only matching rows)
+
+Pass `row_filter` to restrict comparison - row counts, statistics,
+fingerprint, and row-hash/column diff - to only the rows matching a SQL
+condition, instead of the whole table:
+
+```python
+result = validate_tables(
+    "catalog1.bronze.orders", "catalog2.silver.orders",
+    row_filter="id > 20 and id < 100",
+)
+```
+```python
+result = validate_tables(
+    "catalog1.bronze.customers", "catalog2.silver.customers",
+    row_filter="gender = 'male'",
+)
+```
+
+If the condition needs to differ per side, use `source_row_filter`/
+`target_row_filter` instead (or alongside `row_filter`, which then
+applies to both and combines with AND):
+
+```python
+result = validate_tables(
+    "catalog1.bronze.orders", "catalog2.silver.orders",
+    source_row_filter="id > 20",
+    target_row_filter="id > 15",
+)
+```
+
+Each is a raw SQL WHERE-clause fragment, used as-is - not parsed or
+validated, so a typo surfaces as a normal SQL error when the query runs.
+Works in both single-table and schema-wide sweep mode (e.g. filtering
+every matched table in a sweep by the same condition).
+
 ## Quickstart (Python API)
 
 Everything the CLI does is available as a library, built from the same

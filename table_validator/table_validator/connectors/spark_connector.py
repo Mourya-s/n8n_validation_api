@@ -48,6 +48,8 @@ class SparkConnector(BaseSqlConnector):
         outside a notebook with pyspark installed as the optional `spark`
         extra).
         """
+        super().__init__()
+
         if spark is None:
             # Deferred import: pyspark must never be a hard dependency for
             # CLI-only users - only constructing a SparkConnector with no
