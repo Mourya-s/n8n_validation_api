@@ -843,6 +843,236 @@ def test_validate_azure_sql_mismatched_schema_names_still_matches_via_schema_map
     assert "1 total" in result.output
 
 
+def test_validate_synapse_source_reuses_azure_sql_connector_and_validator(
+    tmp_path: Path,
+) -> None:
+    """source_type == synapse must construct AzureSqlConnector with the
+    Synapse server/database/credentials (not a separate connector class -
+    Synapse SQL is protocol-identical T-SQL/ODBC) and drive it through the
+    existing AzureSqlValidator, end to end via the CLI."""
+    from table_validator.auth.azure_auth import AzureCredential
+    from table_validator.config.schema import SourceType
+
+    config_path = tmp_path / "config.yaml"
+    config = ValidatorConfig()
+    config.source_type = SourceType.SYNAPSE
+    config.databricks.workspace_url = "https://adb-123.databricks.net"
+    config.databricks.http_path = "/sql/1.0/warehouses/abc123"
+    config.azure.synapse_server = "myworkspace.sql.azuresynapse.net"
+    config.azure.synapse_database = "myworkspace"
+    config.target_table.catalog = "for_validation1"
+    config.target_table.schema_name = "bronze"
+    config.synapse_source.schema_name = "dbo"
+    save_config(config, config_path)
+
+    output_path = tmp_path / "validation_report.xlsx"
+
+    mock_synapse = MagicMock()
+    mock_synapse.get_schemas.return_value = ["dbo"]
+    mock_synapse.get_tables.return_value = ["customers"]
+    mock_synapse.get_table_schema.return_value = _schema_df([("id", "int", False)])
+    mock_synapse.get_row_count.return_value = 5
+    mock_synapse.get_column_statistics.return_value = {
+        "id": {"null_count": 0, "distinct_count": 5, "min": 1, "max": 5},
+    }
+    mock_synapse.is_min_max_eligible.side_effect = lambda dt: dt.lower() == "int"
+    mock_synapse.get_row_hashes_by_row_number.return_value = pd.DataFrame(
+        [{"row_number": 1, "row_hash": "aaa"}]
+    )
+
+    mock_databricks = _mock_databricks_connector()
+    mock_databricks.get_schemas.return_value = ["bronze"]
+    mock_databricks.get_tables.return_value = ["customers"]
+    mock_databricks.get_row_hashes_by_row_number.return_value = pd.DataFrame(
+        [{"row_number": 1, "row_hash": "aaa"}]
+    )
+
+    connector_calls = []
+
+    def _spy_azure_sql_connector(*args, **kwargs):
+        connector_calls.append(kwargs)
+        return mock_synapse
+
+    with patch(
+        "table_validator.cli.main.DatabricksConnector", return_value=mock_databricks
+    ), patch(
+        "table_validator.cli.main.AzureSqlConnector", side_effect=_spy_azure_sql_connector
+    ), patch(
+        "table_validator.cli.main.get_databricks_token", return_value="dapi_fake"
+    ), patch(
+        "table_validator.cli.main.get_azure_credential",
+        return_value=AzureCredential(synapse_username="u", synapse_password="p"),
+    ):
+        result = runner.invoke(
+            app,
+            ["validate", "--config-path", str(config_path), "--output", str(output_path)],
+        )
+
+    # exit_code 1 here is a real, correctly-detected mismatch (this
+    # fixture's mock row-hash fallback intentionally differs between
+    # source/target), not a wiring failure - the point of this test is
+    # that AzureSqlConnector/AzureSqlValidator were actually invoked
+    # end-to-end for a synapse source, not that the tables match.
+    assert result.exit_code == 1, result.output
+    assert "0 total, 0 passed" not in result.output
+    assert "1 total" in result.output
+
+    assert len(connector_calls) == 1
+    assert connector_calls[0]["server"] == "myworkspace.sql.azuresynapse.net"
+    assert connector_calls[0]["database"] == "myworkspace"
+    assert connector_calls[0]["username"] == "u"
+    assert connector_calls[0]["password"] == "p"
+
+
+def test_validate_synapse_entra_auth_passes_service_principal_not_password(
+    tmp_path: Path,
+) -> None:
+    """With synapse_auth_mode = entra_service_principal, the connector must
+    be constructed with tenant_id/client_id/client_secret and NO username/
+    password - sending both is exactly what the ODBC driver rejects."""
+    from table_validator.auth.azure_auth import AzureCredential
+    from table_validator.config.schema import SourceType, SynapseAuthMode
+
+    config_path = tmp_path / "config.yaml"
+    config = ValidatorConfig()
+    config.source_type = SourceType.SYNAPSE
+    config.databricks.workspace_url = "https://adb-123.databricks.net"
+    config.databricks.http_path = "/sql/1.0/warehouses/abc123"
+    config.azure.synapse_server = "myworkspace.sql.azuresynapse.net"
+    config.azure.synapse_database = "myworkspace"
+    config.azure.synapse_auth_mode = SynapseAuthMode.ENTRA_SERVICE_PRINCIPAL
+    config.azure.tenant_id = "tenant-abc"
+    config.azure.synapse_client_id = "client-abc"
+    config.target_table.catalog = "for_validation1"
+    config.target_table.schema_name = "bronze"
+    config.synapse_source.schema_name = "dbo"
+    save_config(config, config_path)
+
+    output_path = tmp_path / "validation_report.xlsx"
+
+    mock_synapse = MagicMock()
+    mock_synapse.get_schemas.return_value = ["dbo"]
+    mock_synapse.get_tables.return_value = ["customers"]
+    mock_synapse.get_table_schema.return_value = _schema_df([("id", "int", False)])
+    mock_synapse.get_row_count.return_value = 5
+    mock_synapse.get_column_statistics.return_value = {
+        "id": {"null_count": 0, "distinct_count": 5, "min": 1, "max": 5},
+    }
+    mock_synapse.is_min_max_eligible.side_effect = lambda dt: dt.lower() == "int"
+    mock_synapse.get_row_hashes_by_row_number.return_value = pd.DataFrame(
+        [{"row_number": 1, "row_hash": "aaa"}]
+    )
+
+    mock_databricks = _mock_databricks_connector()
+    mock_databricks.get_schemas.return_value = ["bronze"]
+    mock_databricks.get_tables.return_value = ["customers"]
+    mock_databricks.get_row_hashes_by_row_number.return_value = pd.DataFrame(
+        [{"row_number": 1, "row_hash": "aaa"}]
+    )
+
+    connector_calls = []
+
+    def _spy(*args, **kwargs):
+        connector_calls.append(kwargs)
+        return mock_synapse
+
+    with patch(
+        "table_validator.cli.main.DatabricksConnector", return_value=mock_databricks
+    ), patch(
+        "table_validator.cli.main.AzureSqlConnector", side_effect=_spy
+    ), patch(
+        "table_validator.cli.main.get_databricks_token", return_value="dapi_fake"
+    ), patch(
+        "table_validator.cli.main.get_azure_credential",
+        return_value=AzureCredential(synapse_client_secret="secret-abc"),
+    ):
+        runner.invoke(
+            app,
+            ["validate", "--config-path", str(config_path), "--output", str(output_path)],
+        )
+
+    assert len(connector_calls) == 1
+    kwargs = connector_calls[0]
+    assert kwargs["tenant_id"] == "tenant-abc"
+    assert kwargs["client_id"] == "client-abc"
+    assert kwargs["client_secret"] == "secret-abc"
+    assert "username" not in kwargs
+    assert "password" not in kwargs
+
+
+def test_validate_synapse_entra_missing_client_id_errors_cleanly(tmp_path: Path) -> None:
+    """Entra mode with an incomplete service principal must name exactly
+    what's missing, rather than failing later with an opaque ODBC error."""
+    from table_validator.auth.azure_auth import AzureCredential
+    from table_validator.config.schema import SourceType, SynapseAuthMode
+
+    config_path = tmp_path / "config.yaml"
+    config = ValidatorConfig()
+    config.source_type = SourceType.SYNAPSE
+    config.databricks.workspace_url = "https://adb-123.databricks.net"
+    config.databricks.http_path = "/sql/1.0/warehouses/abc123"
+    config.azure.synapse_server = "myworkspace.sql.azuresynapse.net"
+    config.azure.synapse_database = "myworkspace"
+    config.azure.synapse_auth_mode = SynapseAuthMode.ENTRA_SERVICE_PRINCIPAL
+    config.azure.tenant_id = "tenant-abc"
+    # synapse_client_id deliberately left unset
+    config.target_table.catalog = "for_validation1"
+    save_config(config, config_path)
+
+    output_path = tmp_path / "validation_report.xlsx"
+
+    with patch(
+        "table_validator.cli.main.DatabricksConnector",
+        return_value=_mock_databricks_connector(),
+    ), patch(
+        "table_validator.cli.main.get_databricks_token", return_value="dapi_fake"
+    ), patch(
+        "table_validator.cli.main.get_azure_credential",
+        return_value=AzureCredential(synapse_client_secret="secret-abc"),
+    ):
+        result = runner.invoke(
+            app,
+            ["validate", "--config-path", str(config_path), "--output", str(output_path)],
+        )
+
+    assert result.exit_code == 1
+    assert "synapse_client_id" in result.output
+
+
+def test_validate_synapse_missing_credentials_errors_cleanly(tmp_path: Path) -> None:
+    from table_validator.auth.azure_auth import AzureCredential
+    from table_validator.config.schema import SourceType
+
+    config_path = tmp_path / "config.yaml"
+    config = ValidatorConfig()
+    config.source_type = SourceType.SYNAPSE
+    config.databricks.workspace_url = "https://adb-123.databricks.net"
+    config.databricks.http_path = "/sql/1.0/warehouses/abc123"
+    config.azure.synapse_server = "myworkspace.sql.azuresynapse.net"
+    config.azure.synapse_database = "myworkspace"
+    config.target_table.catalog = "for_validation1"
+    save_config(config, config_path)
+
+    output_path = tmp_path / "validation_report.xlsx"
+    mock_databricks = _mock_databricks_connector()
+
+    with patch(
+        "table_validator.cli.main.DatabricksConnector", return_value=mock_databricks
+    ), patch(
+        "table_validator.cli.main.get_databricks_token", return_value="dapi_fake"
+    ), patch(
+        "table_validator.cli.main.get_azure_credential",
+        return_value=AzureCredential(),  # no synapse_username/password
+    ):
+        result = runner.invoke(
+            app,
+            ["validate", "--config-path", str(config_path), "--output", str(output_path)],
+        )
+
+    assert result.exit_code == 1
+    assert "Synapse username/password" in result.output
+
+
 def test_databricks_validation_wires_schema_map_and_table_map_when_names_differ(
     tmp_path: Path,
 ) -> None:
@@ -941,6 +1171,58 @@ def test_databricks_validation_leaves_maps_empty_when_names_are_identical(
     assert request.table_map == {}
     assert request.schemas == ["bronze"]
     assert request.tables == ["customers"]
+
+
+def test_databricks_validation_wires_only_tables_and_table_map_for_schema_sweep(
+    tmp_path: Path,
+) -> None:
+    """Schema-wide sweep (table left blank on both sides): config.only_tables/
+    table_map, set by the wizard's schema-scoping prompt, must flow into
+    request.tables/table_map exactly like the single-table branch does for
+    a table rename - a plain schema sweep with neither set must still be
+    unaffected (covered by the identical-names test above)."""
+    config_path = tmp_path / "config.yaml"
+    config = ValidatorConfig()
+    config.databricks.workspace_url = "https://adb-123.databricks.net"
+    config.databricks.http_path = "/sql/1.0/warehouses/abc123"
+    config.source_table.catalog = "src_cat"
+    config.source_table.schema_name = "bronze"
+    config.source_table.table = None
+    config.target_table.catalog = "tgt_cat"
+    config.target_table.schema_name = "bronze"
+    config.target_table.table = None
+    config.only_tables = ["customers", "orders"]
+    config.table_map = {"cust": "customers"}
+    save_config(config, config_path)
+    output_path = tmp_path / "validation_report.xlsx"
+
+    mock_connector = _mock_databricks_connector()
+
+    captured_requests = []
+    from table_validator.validators.catalog_validator import CatalogValidator
+
+    real_compare_catalogs = CatalogValidator.compare_catalogs
+
+    def spy_compare_catalogs(self, request):
+        captured_requests.append(request)
+        return real_compare_catalogs(self, request)
+
+    with patch(
+        "table_validator.cli.main.DatabricksConnector", return_value=mock_connector
+    ), patch(
+        "table_validator.cli.main.get_databricks_token", return_value="dapi_fake"
+    ), patch(
+        "table_validator.cli.main.get_azure_credential", return_value=None
+    ), patch.object(CatalogValidator, "compare_catalogs", spy_compare_catalogs):
+        runner.invoke(
+            app,
+            ["validate", "--config-path", str(config_path), "--output", str(output_path)],
+        )
+
+    assert len(captured_requests) == 1
+    request = captured_requests[0]
+    assert request.tables == ["customers", "orders"]
+    assert request.table_map == {"cust": "customers"}
 
 
 # ---------------------------------------------------------------------------
@@ -1199,6 +1481,66 @@ def test_validate_rejects_invalid_mode_value(tmp_path: Path) -> None:
 
     assert result.exit_code == 1
     assert "Invalid --mode" in result.output
+
+
+def test_validate_default_does_not_skip_category_summary(tmp_path: Path) -> None:
+    """Without the flag, generate_excel_report must be called with
+    skip_category_summary=False - the Mismatch Categories sheet stays on
+    by default, matching every pre-existing caller's expectations."""
+    config_path = _full_config(tmp_path)
+    output_path = tmp_path / "validation_report.xlsx"
+    mock_connector = _mock_databricks_connector()
+
+    with patch(
+        "table_validator.cli.main.DatabricksConnector", return_value=mock_connector
+    ), patch(
+        "table_validator.cli.main.get_databricks_token", return_value="dapi_fake"
+    ), patch(
+        "table_validator.cli.main.get_azure_credential", return_value=None
+    ), patch(
+        "table_validator.cli.main.generate_excel_report",
+        return_value=str(output_path),
+    ) as mock_generate:
+        result = runner.invoke(
+            app,
+            ["validate", "--config-path", str(config_path), "--output", str(output_path)],
+        )
+
+    assert result.exit_code == 0, result.output
+    mock_generate.assert_called_once()
+    assert mock_generate.call_args.kwargs["skip_category_summary"] is False
+
+
+def test_validate_skip_category_summary_flag_reaches_generate_excel_report(tmp_path: Path) -> None:
+    """--skip-category-summary must be forwarded through to
+    generate_excel_report's skip_category_summary parameter unchanged -
+    the actual sheet-omission behavior itself is covered directly against
+    generate_excel_report in test_excel_report.py."""
+    config_path = _full_config(tmp_path)
+    output_path = tmp_path / "validation_report.xlsx"
+    mock_connector = _mock_databricks_connector()
+
+    with patch(
+        "table_validator.cli.main.DatabricksConnector", return_value=mock_connector
+    ), patch(
+        "table_validator.cli.main.get_databricks_token", return_value="dapi_fake"
+    ), patch(
+        "table_validator.cli.main.get_azure_credential", return_value=None
+    ), patch(
+        "table_validator.cli.main.generate_excel_report",
+        return_value=str(output_path),
+    ) as mock_generate:
+        result = runner.invoke(
+            app,
+            [
+                "validate", "--config-path", str(config_path),
+                "--output", str(output_path), "--skip-category-summary",
+            ],
+        )
+
+    assert result.exit_code == 0, result.output
+    mock_generate.assert_called_once()
+    assert mock_generate.call_args.kwargs["skip_category_summary"] is True
 
 
 def test_validate_yes_flag_never_prompts_for_partition_column(tmp_path: Path, monkeypatch) -> None:

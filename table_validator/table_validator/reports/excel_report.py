@@ -5,25 +5,61 @@ Consumes a CatalogValidationResponse (produced by
 validators.catalog_validator.CatalogValidator) and renders it as either a flat .csv
 file (Table Validation data only) or a formatted, multi-sheet .xlsx
 workbook (Summary / Table Validation / Column Validation / Data
-Mismatches / Row Hash Mismatches).
+Mismatches / Row Hash Mismatches / Mismatch Categories / Suggestions).
 
 Deliberately kept out of comparison_engine.py per the project spec:
 the validator returns clean structured data, and this module is the
 only place that knows about report formatting (csv / openpyxl).
+
+Mismatch Categories sheet (root-cause classification):
+Every RowMismatchDetail already collected under Data Mismatches (the
+result of the validator's own row-hash/column-diff logic - this module
+adds no new comparisons, no new Databricks queries) is additionally
+classified into one of validators.mismatch_classifier's fixed labels -
+NULL_MISMATCH, STRING_TRUNCATION, CASE_DIFFERENCE, WHITESPACE_DIFF,
+PRECISION_LOSS, FORMATTING_DIFF, VALUE_MISMATCH - purely from the two
+already-fetched source/target values (see mismatch_classifier.py's own
+docstring for the exact rule order). generate_excel_report() runs this
+classification + aggregation + sentence-generation pipeline
+(_classify_all_mismatches -> _build_mismatch_category_summary ->
+build_category_sentences) internally, right before writing the Mismatch
+Categories sheet, whenever row-level validation is enabled - it never
+touches how Data Mismatches/Row Hash Mismatches/any other sheet is
+built, and RowMismatchDetail.mismatch_category is the only field it
+writes back onto the response (see models.py). Pass
+skip_category_summary=True (or the CLI's --skip-category-summary) to
+omit just this sheet and get the exact pre-categorization report back,
+byte-for-byte, on every other sheet.
 """
 
 from __future__ import annotations
 
 import csv
 import logging
-from typing import Any, List, Optional, Tuple
+from collections import Counter, defaultdict
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
 
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.worksheet import Worksheet
 
-from table_validator.models import CatalogValidationResponse, ValidationStatus
+from table_validator.models import (
+    CatalogValidationResponse,
+    RowMismatchDetail,
+    ValidationStatus,
+)
+from table_validator.validators.mismatch_classifier import (
+    CASE_DIFFERENCE,
+    FORMATTING_DIFF,
+    NULL_MISMATCH,
+    PRECISION_LOSS,
+    STRING_TRUNCATION,
+    VALUE_MISMATCH,
+    WHITESPACE_DIFF,
+    classify_mismatch,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -115,6 +151,10 @@ SUGGESTION_HEADERS = [
     "Source Schema", "Source Table", "Column", "Issue Type", "Suggestion",
 ]
 
+CATEGORY_SUMMARY_HEADERS = [
+    "Category", "Count", "% of Total", "Top Table", "Top Column",
+]
+
 SUMMARY_METRIC_LABELS = [
     "Total Tables", "Passed Tables", "Failed Tables",
     "Error Tables", "Skipped Tables", "Pass Percentage",
@@ -162,6 +202,30 @@ _ROW_HASH_STATUS_FILL_MAP = {
     "MISSING_IN_TARGET": ValidationStatus.FAIL,
     "MISSING_IN_SOURCE": ValidationStatus.FAIL,
     "DUPLICATE_KEY": ValidationStatus.FAIL,
+}
+
+# Conditional Category-column color per mismatch_classifier label, for the
+# Mismatch Categories sheet - reuses the exact same fill/font pairs as
+# STATUS_FILLS/STATUS_FONTS above rather than inventing new colors, so the
+# whole workbook stays visually consistent (red=FAIL-like/severe, orange=
+# ERROR-like/needs attention, green=PASS-like/benign, gray=neutral/
+# uncategorized-pattern). Severity here is a judgment call about how
+# likely each category is to indicate a real data/schema problem, not a
+# property mismatch_classifier itself computes:
+#   - NULL_MISMATCH, VALUE_MISMATCH: most likely a genuine data problem
+#     (lost data, unexplained change) -> red (FAIL).
+#   - STRING_TRUNCATION, PRECISION_LOSS: a real schema/type sizing issue,
+#     but a well-understood, mechanically fixable one -> orange (ERROR).
+#   - CASE_DIFFERENCE, WHITESPACE_DIFF, FORMATTING_DIFF: same underlying
+#     value, cosmetic/representational only -> green (PASS-like/benign).
+_CATEGORY_STATUS_MAP = {
+    NULL_MISMATCH: ValidationStatus.FAIL,
+    VALUE_MISMATCH: ValidationStatus.FAIL,
+    STRING_TRUNCATION: ValidationStatus.ERROR,
+    PRECISION_LOSS: ValidationStatus.ERROR,
+    CASE_DIFFERENCE: ValidationStatus.PASS,
+    WHITESPACE_DIFF: ValidationStatus.PASS,
+    FORMATTING_DIFF: ValidationStatus.PASS,
 }
 
 
@@ -362,6 +426,364 @@ def _build_column_rows(result: CatalogValidationResponse) -> List[List[Any]]:
 
     rows.sort(key=lambda r: (r[0], r[1], r[2]))
     return rows
+
+
+# ---------------------------------------------------------------------------
+# Mismatch categorization (phase 2): classify every RowMismatchDetail
+# already collected by the validator, then roll the results up into a
+# per-category summary. Pure in-memory computation over data the validator
+# already produced - no new Databricks queries, no Excel writing here (the
+# summary is consumed by a later phase's sheet-builder).
+# ---------------------------------------------------------------------------
+@dataclass
+class MismatchCategorySummary:
+    """One row of the eventual category-summary view: how often a given
+    mismatch_classifier category occurred, what share of all mismatches
+    that represents, and which table/column it showed up in most - a
+    quick pointer for "where do I look first for this kind of issue"
+    without having to scan the full Data Mismatches sheet."""
+
+    category: str
+    count: int
+    pct: float
+    top_table: str
+    top_column: str
+
+
+def _classify_all_mismatches(result: CatalogValidationResponse) -> List[RowMismatchDetail]:
+    """
+    Classify every RowMismatchDetail in `result` in place, setting its
+    mismatch_category field via classify_mismatch(), and return the flat
+    list of details classified (same traversal order as
+    _build_mismatch_rows, so both stay consistent).
+
+    Mutates the response in place (rather than building a parallel
+    structure) so mismatch_category travels with each RowMismatchDetail
+    wherever it goes next - the Data Mismatches sheet, a future JSON
+    response, etc. - matching the field's own docstring in models.py.
+    Idempotent: re-running this on an already-classified response just
+    recomputes the same labels.
+    """
+    all_details: List[RowMismatchDetail] = []
+    for schema in result.schemas:
+        for table in schema.tables:
+            if table.data is None:
+                continue
+            for detail in table.data.sample_changed_detail:
+                detail.mismatch_category = classify_mismatch(
+                    detail.source_value, detail.target_value
+                )
+                all_details.append(detail)
+    return all_details
+
+
+def _build_mismatch_category_summary(
+    result: CatalogValidationResponse,
+) -> List[MismatchCategorySummary]:
+    """
+    Classify every mismatch (via _classify_all_mismatches) and roll the
+    results up into one MismatchCategorySummary per category that
+    actually occurred at least once - count, percentage of the total
+    mismatch count, and the table/column each category shows up in most
+    often (its single biggest concentration, not an exhaustive list -
+    the Data Mismatches sheet already has full per-row detail).
+
+    Percentages are computed over the total number of classified
+    mismatches across every table/schema in `result`, not per-table -
+    "42% of all mismatches are VALUE_MISMATCH" is the intended reading.
+    Returns [] when there are no mismatches to classify at all (e.g.
+    every table PASSed, or row-level comparison never ran).
+    """
+    all_details = _classify_all_mismatches(result)
+    total = len(all_details)
+    if total == 0:
+        return []
+
+    category_counts: Counter = Counter()
+    # category -> table -> count, and category -> column -> count, kept
+    # separately since "top table" and "top column" for a category are
+    # independent questions (the biggest table by mismatch count for a
+    # category need not share its name with the biggest column).
+    category_table_counts: Dict[str, Counter] = defaultdict(Counter)
+    category_column_counts: Dict[str, Counter] = defaultdict(Counter)
+
+    for detail in all_details:
+        category = detail.mismatch_category
+        category_counts[category] += 1
+        category_table_counts[category][detail.table] += 1
+        # source_mismatch_column is only set when column_map actually
+        # renamed this column - mismatch_column (the canonical/target
+        # name) is what every other sheet groups by, so use it here too
+        # for consistency.
+        category_column_counts[category][detail.mismatch_column] += 1
+
+    summaries: List[MismatchCategorySummary] = []
+    for category, count in category_counts.items():
+        top_table, _ = category_table_counts[category].most_common(1)[0]
+        top_column, _ = category_column_counts[category].most_common(1)[0]
+        summaries.append(
+            MismatchCategorySummary(
+                category=category,
+                count=count,
+                pct=round(count / total * 100, 2),
+                top_table=top_table,
+                top_column=top_column,
+            )
+        )
+
+    # Most common category first - the natural "look at this one first"
+    # reading order; ties broken alphabetically for deterministic output.
+    summaries.sort(key=lambda s: (-s.count, s.category))
+    return summaries
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: plain-English sentences per category, for a future Suggestions-
+# style sheet. Pure string formatting over Phase 2's summaries plus a
+# small per-column length stat (needed only for STRING_TRUNCATION's
+# avg-chars wording) - no Excel writing here yet, no new queries.
+# ---------------------------------------------------------------------------
+@dataclass
+class ColumnLenStats:
+    """Average source/target string length for one column, across every
+    mismatch on it that was actually classified as STRING_TRUNCATION -
+    the only category whose sentence needs raw value lengths rather than
+    just a count. Built from the same classified RowMismatchDetail list
+    Phase 2's _classify_all_mismatches() already produces."""
+
+    avg_source_len: float
+    avg_target_len: float
+
+
+def build_column_len_stats(
+    details: List[RowMismatchDetail],
+) -> Dict[str, ColumnLenStats]:
+    """
+    Compute average source/target value length per column, over only the
+    details already classified as STRING_TRUNCATION (mismatch_category
+    must be set - i.e. `details` should come from
+    _classify_all_mismatches(), not a raw, unclassified list). Columns
+    with no STRING_TRUNCATION mismatches are simply absent from the
+    result - there's nothing meaningful to average.
+
+    Grouped by mismatch_column (the canonical/target name), matching
+    _build_mismatch_category_summary's own convention for a renamed
+    column. Non-string values are skipped (len() on a coerced str() would
+    silently fabricate a "length" for a number/None, which STRING_
+    TRUNCATION's classification already restricts to actual strings -
+    this mirrors that same restriction here rather than reinterpreting
+    the rule).
+    """
+    source_lens: Dict[str, List[int]] = defaultdict(list)
+    target_lens: Dict[str, List[int]] = defaultdict(list)
+
+    for detail in details:
+        if detail.mismatch_category != STRING_TRUNCATION:
+            continue
+        if not isinstance(detail.source_value, str) or not isinstance(detail.target_value, str):
+            continue
+        source_lens[detail.mismatch_column].append(len(detail.source_value))
+        target_lens[detail.mismatch_column].append(len(detail.target_value))
+
+    return {
+        column: ColumnLenStats(
+            avg_source_len=sum(source_lens[column]) / len(source_lens[column]),
+            avg_target_len=sum(target_lens[column]) / len(target_lens[column]),
+        )
+        for column in source_lens
+    }
+
+
+def build_category_sentences(
+    summaries: List[MismatchCategorySummary],
+    column_stats: Dict[str, ColumnLenStats],
+) -> List[str]:
+    """
+    One plain-English sentence per category present in `summaries` -
+    honest and specific, built only from numbers Phase 1/2 actually
+    computed (counts, percentages, top table/column, and - for
+    STRING_TRUNCATION only - the avg source/target length in
+    column_stats). Deliberately no fabricated confidence scores, decimal-
+    place counts, or DECIMAL(p,s) guesses: mismatch_classifier never sees
+    column type/schema information (by Phase 1's own design), so nothing
+    here invents numbers it doesn't have - PRECISION_LOSS's sentence
+    stays qualitative rather than naming a decimal count it can't derive.
+
+    STRING_TRUNCATION's "{count} of {total}" wording uses the grand total
+    across every category, computed here as sum(s.count for s in
+    summaries) - exact as long as `summaries` is the complete list from
+    _build_mismatch_category_summary (true for every real caller), unlike
+    reconstructing it from MismatchCategorySummary's already-rounded pct
+    (which would drift, and divide by zero at pct == 0).
+
+    Order follows `summaries` as given (Phase 2 already sorts most-common
+    category first) - this function doesn't re-sort. A category with no
+    template below (there shouldn't be one, since mismatch_classifier's
+    label set is fixed and total) is skipped rather than raising, so a
+    future new category doesn't crash report generation before its own
+    sentence template is added.
+    """
+    total = sum(s.count for s in summaries)
+    sentences: List[str] = []
+
+    for summary in summaries:
+        if summary.category == NULL_MISMATCH:
+            sentences.append(
+                f"{summary.count} nulls mismatched in {summary.top_column} — "
+                f"check nullable constraint differences between source and "
+                f"target."
+            )
+
+        elif summary.category == STRING_TRUNCATION:
+            stats = column_stats.get(summary.top_column)
+            if stats is not None:
+                src_len = round(stats.avg_source_len, 1)
+                tgt_len = round(stats.avg_target_len, 1)
+                length_note = f" (avg {src_len}→{tgt_len} chars)"
+            else:
+                # No length stats available for this column (e.g. caller
+                # passed an empty/mismatched column_stats) - say so
+                # rather than silently omitting the parenthetical or
+                # inventing a length.
+                length_note = " (length detail unavailable)"
+            sentences.append(
+                f"{summary.count} of {total} mismatches in "
+                f"`{summary.top_column}` are truncations{length_note} — "
+                f"target column may be too narrow."
+            )
+
+        elif summary.category == CASE_DIFFERENCE:
+            sentences.append(
+                f"{summary.count} mismatches are case-only — consider "
+                f"UPPER/LOWER normalization in the transform layer."
+            )
+
+        elif summary.category == WHITESPACE_DIFF:
+            sentences.append(
+                f"{summary.count} mismatches differ only by whitespace — "
+                f"check TRIM logic in the pipeline."
+            )
+
+        elif summary.category == PRECISION_LOSS:
+            sentences.append(
+                f"{summary.count} numeric mismatches lose precision after "
+                f"conversion — verify the column's decimal/numeric type "
+                f"definition matches on both sides."
+            )
+
+        elif summary.category == FORMATTING_DIFF:
+            sentences.append(
+                f"{summary.count} mismatches are format-only (same value, "
+                f"different representation) — align date/number format in "
+                f"target schema."
+            )
+
+        elif summary.category == VALUE_MISMATCH:
+            sentences.append(
+                f"{summary.count} mismatches have no detectable pattern — "
+                f"manual review recommended for `{summary.top_column}`."
+            )
+
+    return sentences
+
+
+def _build_mismatch_category_sheet(wb: Workbook, result: CatalogValidationResponse) -> None:
+    """
+    Phase 4: renders Phase 2/3's category summary + sentences as their own
+    "Mismatch Categories" sheet - purely additive (a new sheet; the Data
+    Mismatches and Suggestions sheets are untouched by this function and
+    built by their own separate _build_*_sheet calls).
+
+    Two sections on one sheet, stacked vertically rather than split across
+    sheets, so a reader sees the "what" (Section 1's table) right above
+    the "why/what to do" (Section 2's sentences) in one place:
+      Section 1 - Summary Table: one row per MismatchCategorySummary
+        (Category | Count | % of Total | Top Table | Top Column), header-
+        styled like every other sheet's table, with each Category cell
+        colored via _CATEGORY_STATUS_MAP/STATUS_FILLS/STATUS_FONTS - the
+        exact same fill/font pairs the rest of the workbook already uses
+        for PASS/FAIL/ERROR, so this sheet doesn't introduce a second,
+        inconsistent color language.
+      Section 2 - Insight Sentences: Phase 3's plain-English sentences,
+        one per row, directly below Section 1 with a blank row and its
+        own sub-heading between them.
+
+    Skips rendering entirely (still creates an empty, header-only sheet)
+    when there are no mismatches to categorize - matches how e.g. Row
+    Hash Mismatches renders zero data rows rather than omitting itself,
+    once its owning validation type is enabled.
+    """
+    ws = wb.create_sheet("Mismatch Categories")
+
+    summaries = _build_mismatch_category_summary(result)
+    classified = _classify_all_mismatches(result)
+    column_stats = build_column_len_stats(classified)
+    sentences = build_category_sentences(summaries, column_stats)
+
+    # --- Section 1: Summary Table -----------------------------------
+    _write_header_row(ws, CATEGORY_SUMMARY_HEADERS)
+
+    row_idx = 2
+    for summary in summaries:
+        values = [
+            summary.category,
+            summary.count,
+            f"{summary.pct:.2f}%",
+            summary.top_table,
+            summary.top_column,
+        ]
+        for col_idx, value in enumerate(values, start=1):
+            cell = ws.cell(row=row_idx, column=col_idx, value=value)
+            cell.font = VALUE_FONT
+            cell.border = THIN_BORDER
+            cell.alignment = Alignment(vertical="center", wrap_text=False)
+
+            if col_idx == 1:
+                # Conditional Category-column color - falls back to no
+                # fill/font override for a category not in the map
+                # (there shouldn't be one, since mismatch_classifier's
+                # label set is fixed, but this stays defensive rather
+                # than raising over a purely cosmetic mapping).
+                status = _CATEGORY_STATUS_MAP.get(summary.category)
+                if status in STATUS_FILLS:
+                    cell.fill = STATUS_FILLS[status]
+                    cell.font = STATUS_FONTS[status]
+        row_idx += 1
+
+    last_table_row = max(row_idx - 1, 1)
+    _autofit(
+        ws, CATEGORY_SUMMARY_HEADERS,
+        [
+            [s.category, s.count, f"{s.pct:.2f}%", s.top_table, s.top_column]
+            for s in summaries
+        ],
+    )
+    _enable_filter(ws, len(CATEGORY_SUMMARY_HEADERS), last_table_row)
+
+    # --- Section 2: Insight Sentences -------------------------------
+    # Two blank rows separate the auto-filtered table above from the
+    # free-text sentences below, so the filter's own dropdown-header row
+    # is never mistaken for part of this second section. Skipped
+    # entirely (no heading, no rows) when there are no mismatches to
+    # categorize at all - an "Insight Sentences" heading with nothing
+    # under it would be a confusing empty section, not a useful one.
+    if sentences:
+        sentences_header_row = last_table_row + 3
+        heading_cell = ws.cell(row=sentences_header_row, column=1, value="Insight Sentences")
+        heading_cell.font = LABEL_FONT
+
+        sentence_row = sentences_header_row + 1
+        for sentence in sentences:
+            cell = ws.cell(row=sentence_row, column=1, value=sentence)
+            cell.font = VALUE_FONT
+            cell.alignment = Alignment(vertical="top", wrap_text=True)
+            ws.merge_cells(
+                start_row=sentence_row, start_column=1,
+                end_row=sentence_row, end_column=len(CATEGORY_SUMMARY_HEADERS),
+            )
+            sentence_row += 1
+
+    ws.freeze_panes = ws.cell(row=2, column=1)
 
 
 def _build_mismatch_rows(result: CatalogValidationResponse) -> List[List[Any]]:
@@ -901,12 +1323,13 @@ def generate_excel_report(
     output_path: str,
     source_type: Optional[str] = None,
     enabled_validations: Optional[set] = None,
+    skip_category_summary: bool = False,
 ) -> str:
     """
     Render a CatalogValidationResponse as a formatted, multi-sheet .xlsx
     workbook: Summary, Table Validation, Column Validation, Data
-    Mismatches, Row Hash Mismatches, Suggestions. Returns the output_path
-    for convenience.
+    Mismatches, Row Hash Mismatches, Mismatch Categories, Suggestions.
+    Returns the output_path for convenience.
 
     source_type (e.g. "databricks"/"azure_blob"/"azure_sql") is optional
     and purely cosmetic - shown on the Summary sheet next to Overall
@@ -917,16 +1340,28 @@ def generate_excel_report(
     Table Validation columns and whole sheets belonging to a validation
     type NOT in this set are omitted entirely - "column" gates the
     Column Validation sheet plus the column-level columns on Table
-    Validation, "row" gates Data Mismatches/Row Hash Mismatches plus the
-    row-level columns on Table Validation. None means "show everything"
-    (no filtering), matching prior behavior for any caller that doesn't
-    pass it.
+    Validation, "row" gates Data Mismatches/Row Hash Mismatches/Mismatch
+    Categories (the last one is derived entirely from the same row-level
+    mismatch detail, so it's gated identically) plus the row-level
+    columns on Table Validation. None means "show everything" (no
+    filtering), matching prior behavior for any caller that doesn't pass
+    it.
+
+    skip_category_summary (default False) omits ONLY the Mismatch
+    Categories sheet, independent of enabled_validations - every other
+    sheet (Data Mismatches included) renders exactly as it did before the
+    mismatch-categorization feature existed. This is the mechanism behind
+    the CLI's `--skip-category-summary` flag: a way to always recover the
+    pre-categorization report byte-for-byte, in case the classifier's
+    output is ever undesired or found to be wrong for a given run,
+    without needing to also give up row-level validation entirely (which
+    enabled_validations={"row" not included} would otherwise force).
     """
     logger.info(
         "Generating Excel report | source=%s | target=%s | source_type=%s | "
-        "enabled_validations=%s | -> %s",
+        "enabled_validations=%s | skip_category_summary=%s | -> %s",
         result.source_catalog, result.target_catalog, source_type,
-        enabled_validations, output_path,
+        enabled_validations, skip_category_summary, output_path,
     )
 
     validations_run = (
@@ -944,6 +1379,8 @@ def generate_excel_report(
     if enabled_validations is None or "row" in enabled_validations:
         _build_data_mismatches_sheet(wb, result)
         _build_row_hash_mismatches_sheet(wb, result)
+        if not skip_category_summary:
+            _build_mismatch_category_sheet(wb, result)
 
     _build_suggestions_sheet(wb, result)
 

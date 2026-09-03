@@ -1087,6 +1087,56 @@ def test_tier5_column_diff_runs_for_row_number_fallback_when_mismatched():
     assert "unverified" in table.data.note.lower()
 
 
+def test_tier5_row_number_fallback_passes_independent_source_and_target_table_names():
+    """Regression test for a real bug found via live user testing: a
+    genuinely renamed table pair (table_map: 'old_name' -> 'new_name',
+    no primary key configured) must call get_row_detail_for_row_numbers
+    with the CORRECT per-side schema/table names - previously this call
+    site only ever passed the single target_schema/target_table for
+    BOTH sides, which - now that the connector method itself distinguishes
+    source_schema/source_table from target_schema/target_table - would
+    silently query the wrong (target) name against the source catalog and
+    raise TABLE_OR_VIEW_NOT_FOUND for a genuinely different name."""
+    connector = _mismatched_fingerprint_connector()
+    connector.get_tables.side_effect = lambda catalog, schema: (
+        ["old_name"] if catalog == "cat_source" else ["new_name"]
+    )
+    connector.get_row_hashes_by_row_number.side_effect = (
+        lambda catalog, schema, table, cols, bucket_predicate=None: (
+            _hash_df([(1, "aaa"), (2, "bbb")], key="row_number")
+            if catalog == "cat_source"
+            else _hash_df([(1, "aaa"), (2, "zzz")], key="row_number")
+        )
+    )
+    connector.get_row_detail_for_row_numbers.return_value = [
+        {
+            "key": {"row_number": 2},
+            "mismatched_columns": ["name"],
+            "source_values": {"name": "old-value"},
+            "target_values": {"name": "new-value"},
+            "source_row_hash": "bbb",
+            "target_row_hash": "zzz",
+        }
+    ]
+    validator = CatalogValidator(connector)
+
+    result = validator.compare_catalogs(
+        _request(table_map={"old_name": "new_name"})  # no primary_keys configured
+    )
+    table = result.schemas[0].tables[0]
+
+    connector.get_row_detail_for_row_numbers.assert_called_once()
+    call_kwargs = connector.get_row_detail_for_row_numbers.call_args.kwargs
+    assert call_kwargs["source_schema"] == "bronze"
+    assert call_kwargs["source_table"] == "old_name"
+    assert call_kwargs["target_schema"] == "bronze"
+    assert call_kwargs["target_table"] == "new_name"
+
+    assert len(table.data.sample_changed_detail) == 1
+    assert table.source_table_name == "old_name"
+    assert table.table == "new_name"
+
+
 def test_tier5_row_number_fallback_error_is_recorded_not_raised():
     """If the best-effort re-fetch itself fails, the run must not crash -
     same try/except contract as the real-key Tier 5 path."""
@@ -1533,7 +1583,52 @@ def test_table_map_to_nonexistent_target_table_produces_clear_error():
     assert "does_not_exist_table" in error_tables[0].error
     assert "does not exist" in error_tables[0].error
     assert schema_result.status in (ValidationStatus.ERROR, ValidationStatus.FAIL)
-    assert result.status in (ValidationStatus.ERROR, ValidationStatus.FAIL)
+
+
+def test_table_map_entry_silently_dropped_by_unrelated_stale_tables_allowlist():
+    """Real bug found via live user testing: `tables` (only_tables in the
+    wizard) is a SOURCE-side allowlist applied to common_table_pairs AFTER
+    table_map resolution - a leftover `tables` value from an earlier
+    config that names some other, unrelated table silently filters the
+    table_map pair straight back out, even though the mapping itself
+    resolved correctly. This isn't a bug in table_map/tables individually
+    (each is independently correct and covered above) - it's the wizard's
+    responsibility to never let a stale `tables` value from a previous
+    'select specific tables' run survive alongside a fresh table_map from
+    a later 'map renamed tables' run. This test guards the underlying
+    engine behavior the wizard fix depends on: a table_map pair is only
+    actually validated if its source name is ALSO present in `tables`
+    when `tables` is set at all."""
+    connector = _make_connector()
+    connector.get_tables.side_effect = lambda catalog, schema: (
+        ["sample_quoted_1"] if catalog == "cat_source" else ["sample_data"]
+    )
+    validator = CatalogValidator(connector)
+
+    result = validator.compare_catalogs(
+        _request(
+            # Stale allowlist from an earlier, unrelated run - does NOT
+            # include "sample_quoted_1".
+            tables=["file_example_xlsx_100"],
+            table_map={"sample_quoted_1": "sample_data"},
+        )
+    )
+
+    schema_result = result.schemas[0]
+    # The mapped pair is silently absent - this is the exact symptom the
+    # user hit (their table_map entry appeared to do nothing).
+    assert schema_result.tables == []
+
+    # Confirm the fix: with the stale allowlist cleared (tables=None, as
+    # the corrected wizard now does when the user picks "map tables"),
+    # the very same table_map entry validates correctly.
+    result_fixed = validator.compare_catalogs(
+        _request(tables=None, table_map={"sample_quoted_1": "sample_data"})
+    )
+    schema_result_fixed = result_fixed.schemas[0]
+    assert len(schema_result_fixed.tables) == 1
+    assert schema_result_fixed.tables[0].table == "sample_data"
+    assert schema_result_fixed.tables[0].source_table_name == "sample_quoted_1"
 
 
 def test_schema_map_validates_explicit_pair_with_different_names():

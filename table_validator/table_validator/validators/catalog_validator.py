@@ -1990,21 +1990,19 @@ class CatalogValidator:
         using_row_number_fallback: bool = False,
         bucket_predicate: Optional[Tuple[str, Any]] = None,
     ) -> None:
-        # NOTE: DatabricksConnector.get_row_detail_for_keys/
-        # get_row_detail_for_row_numbers each take a single schema/table
-        # pair used to qualify BOTH source_catalog and target_catalog
-        # (they assume the schema/table name is shared) - an asymmetric
-        # schema_map/table_map pair therefore re-queries both sides under
-        # the TARGET-side name, matching the reporting convention used
-        # everywhere else in this class. Widening those connector methods
-        # to accept independent source/target schema+table names is out
-        # of scope for this change; today this only matters when the
-        # source-side name doesn't actually exist under the target's own
-        # catalog, which would already have been caught as a BLOCKING
-        # Tier 0 schema difference or a missing-table pair error before
-        # Tier 5 could ever run. key_columns itself is assumed identical
-        # on both sides (a key column renamed via column_map is guarded
-        # against as a BLOCKING error at Tier 0, before Tier 5 ever runs).
+        # DatabricksConnector.get_row_detail_for_keys/
+        # get_row_detail_for_row_numbers now accept independent
+        # source_schema/source_table + target_schema/target_table (passed
+        # below), so an asymmetric schema_map/table_map pair correctly
+        # queries each side under its OWN name - previously both were
+        # qualified under the single TARGET-side name, which raised
+        # TABLE_OR_VIEW_NOT_FOUND against the source catalog whenever the
+        # two names actually differed (a real bug, not just a
+        # documented limitation - found via a live run with a genuinely
+        # renamed table pair and no primary key configured). key_columns
+        # itself is still assumed identical on both sides (a key column
+        # renamed via column_map is guarded against as a BLOCKING error
+        # at Tier 0, before Tier 5 ever runs).
         key_lower = {k.lower() for k in key_columns}
         if using_row_number_fallback:
             # No real key to exclude - every common column is a value
@@ -2050,6 +2048,10 @@ class CatalogValidator:
                     bucket_predicate=bucket_predicate,
                     target_order_by_columns=target_value_names,
                     target_value_columns=target_value_names,
+                    source_schema=source_schema,
+                    source_table=source_table,
+                    target_schema=target_schema,
+                    target_table=target_table,
                 )
             else:
                 detail = self.databricks.get_row_detail_for_keys(
@@ -2062,6 +2064,10 @@ class CatalogValidator:
                     value_columns=source_value_names,
                     limit_samples=request.max_sample_rows,
                     target_value_columns=target_value_names,
+                    source_schema=source_schema,
+                    source_table=source_table,
+                    target_schema=target_schema,
+                    target_table=target_table,
                 )
         except Exception as exc:
             logger.exception(

@@ -30,6 +30,22 @@ class SourceType(str, Enum):
     DATABRICKS = "databricks"
     AZURE_BLOB = "azure_blob"
     AZURE_SQL = "azure_sql"
+    SYNAPSE = "synapse"
+
+
+class SynapseAuthMode(str, Enum):
+    """
+    How the Synapse SQL pool connection authenticates.
+
+    Defaults to SQL so existing saved configs (from before Entra support
+    existed) keep working unchanged - they were all SQL-auth logins.
+    ENTRA_SERVICE_PRINCIPAL swaps UID/PWD for an Entra access token
+    fetched from an app registration, which is what a workspace with SQL
+    authentication disabled (Entra-only) requires.
+    """
+
+    SQL = "sql"
+    ENTRA_SERVICE_PRINCIPAL = "entra_service_principal"
 
 
 class AzureConfig(BaseModel):
@@ -40,6 +56,12 @@ class AzureConfig(BaseModel):
     connectors don't need them yet. storage_account/container and
     sql_server/sql_database cover the two connector types this tool
     actually talks to today (Blob Storage and Azure SQL Database).
+    synapse_server/synapse_database are the equivalent pair for a Synapse
+    SQL pool (dedicated or serverless) source - kept as separate fields
+    rather than reusing sql_server/sql_database so a user can have both an
+    Azure SQL Database config and a Synapse config saved at once (only the
+    section matching source_type is read at validate time, same
+    convention as blob_source/sql_source).
     """
 
     tenant_id: Optional[str] = None
@@ -50,6 +72,31 @@ class AzureConfig(BaseModel):
 
     sql_server: Optional[str] = None
     sql_database: Optional[str] = None
+
+    synapse_server: Optional[str] = None
+    synapse_database: Optional[str] = None
+
+    synapse_auth_mode: SynapseAuthMode = Field(
+        default=SynapseAuthMode.SQL,
+        description=(
+            "How to authenticate to the Synapse SQL pool. 'sql' uses a "
+            "SQL login (SYNAPSE_USERNAME/SYNAPSE_PASSWORD in .env); "
+            "'entra_service_principal' uses a Microsoft Entra ID app "
+            "registration (tenant_id + synapse_client_id here, plus "
+            "SYNAPSE_CLIENT_SECRET in .env) and never sends a "
+            "username/password at all."
+        ),
+    )
+
+    synapse_client_id: Optional[str] = Field(
+        default=None,
+        description=(
+            "Entra ID application (client) ID of the service principal "
+            "used when synapse_auth_mode is 'entra_service_principal'. "
+            "The matching tenant is read from azure.tenant_id, and the "
+            "secret from SYNAPSE_CLIENT_SECRET in ~/.table_validator/.env."
+        ),
+    )
 
 
 class DatabricksConfig(BaseModel):
@@ -124,6 +171,24 @@ class SqlSourceConfig(BaseModel):
     (sql_server/sql_database); this section scopes which schema/table
     within that database are compared, same optional-means-"compare all"
     convention as TableRef.
+    """
+
+    schema_name: Optional[str] = Field(default=None, alias="schema")
+    table: Optional[str] = None
+
+    model_config = {"populate_by_name": True}
+
+
+class SynapseSourceConfig(BaseModel):
+    """
+    Non-secret scoping for a Synapse SQL pool source (source_type =
+    synapse, dedicated or serverless). Server/database themselves live on
+    AzureConfig (synapse_server/synapse_database); this section scopes
+    which schema/table within that pool are compared - identical shape
+    and convention to SqlSourceConfig, kept as its own class (rather than
+    reusing SqlSourceConfig) so a saved Azure SQL scoping and a saved
+    Synapse scoping don't overwrite each other when switching source
+    types back and forth in the wizard.
     """
 
     schema_name: Optional[str] = Field(default=None, alias="schema")
@@ -218,8 +283,40 @@ class ValidatorConfig(BaseModel):
         ),
     )
 
+    only_tables: Optional[List[str]] = Field(
+        default=None,
+        description=(
+            "Optional allowlist: if set, only these table names (within "
+            "the schema named in source_table/target_table) are "
+            "validated - every other common table in that schema is "
+            "skipped. Only meaningful when a schema is named but no "
+            "specific table is (a schema-wide sweep); ignored otherwise. "
+            "A name here that isn't actually a common table is silently "
+            "absent from the effective set, same convention as "
+            "only_columns. If a table appears in both only_tables and "
+            "table_map, the table_map entry wins for that table."
+        ),
+    )
+
+    table_map: Dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "Optional map of source-schema table name -> target-schema "
+            "table name, for tables renamed between source and target "
+            "within an otherwise schema-wide sweep (e.g. source has "
+            "'cust', target has 'customers'). Only meaningful when a "
+            "schema is named but no specific table is - for the single-"
+            "table case, naming both source_table.table and "
+            "target_table.table already pairs them directly regardless "
+            "of name. Unmapped tables are still matched by identical "
+            "name as usual. Set interactively by `configure`'s table-"
+            "mapping prompt, or by hand."
+        ),
+    )
+
     blob_source: BlobSourceConfig = Field(default_factory=BlobSourceConfig)
     sql_source: SqlSourceConfig = Field(default_factory=SqlSourceConfig)
+    synapse_source: SynapseSourceConfig = Field(default_factory=SynapseSourceConfig)
 
     validations: List[ValidationType] = Field(
         default_factory=lambda: [

@@ -840,6 +840,15 @@ class RowMismatchDetail(BaseModel):
     source_row_hash: Optional[Any] = None
     target_row_hash: Optional[Any] = None
 
+    # Populated by reports/excel_report.py's classification pass (a
+    # report-generation-time enrichment, not something the validator
+    # itself computes) - one of validators.mismatch_classifier's category
+    # labels (NULL_MISMATCH, STRING_TRUNCATION, ...), or None if
+    # classification hasn't run yet (e.g. for a caller inspecting the raw
+    # CatalogValidationResponse straight from CatalogValidator, before
+    # any report was generated).
+    mismatch_category: Optional[str] = None
+
     verified: bool = Field(
         default=True,
         description=(

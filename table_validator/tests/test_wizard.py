@@ -292,6 +292,67 @@ def test_all_option_combined_with_individual_choice_has_no_duplicates():
 
 
 # ---------------------------------------------------------------------------
+# _resolve_validation_selection(): catalog/schema shown and toggled as one
+# combined checkbox ("catalog & schema") rather than two separate ones.
+# ---------------------------------------------------------------------------
+def test_catalog_and_schema_combined_option_resolves_to_both_types():
+    from table_validator.cli.wizard import _resolve_validation_selection
+    from table_validator.config.schema import ValidationType
+
+    result = _resolve_validation_selection(["catalog & schema"])
+
+    assert result == [ValidationType.CATALOG, ValidationType.SCHEMA]
+
+
+def test_catalog_and_schema_combined_option_with_column_and_row():
+    from table_validator.cli.wizard import _resolve_validation_selection
+    from table_validator.config.schema import ValidationType
+
+    result = _resolve_validation_selection(["catalog & schema", "column", "row"])
+
+    assert result == [
+        ValidationType.CATALOG,
+        ValidationType.SCHEMA,
+        ValidationType.COLUMN,
+        ValidationType.ROW,
+    ]
+
+
+def test_deselecting_catalog_and_schema_option_omits_both_types():
+    from table_validator.cli.wizard import _resolve_validation_selection
+    from table_validator.config.schema import ValidationType
+
+    result = _resolve_validation_selection(["column", "row"])
+
+    assert ValidationType.CATALOG not in result
+    assert ValidationType.SCHEMA not in result
+    assert result == [ValidationType.COLUMN, ValidationType.ROW]
+
+
+def test_deselecting_row_only_omits_row(tmp_path, monkeypatch):
+    """End-to-end: unchecking just 'row' in the wizard's checkbox must
+    leave catalog/schema/column in config.validations and drop only ROW -
+    this is what ultimately gates the Data Mismatches/Row Hash Mismatches
+    sheets and row-level Table Validation columns in the Excel report."""
+    from table_validator.config.schema import ValidationType
+
+    config = _run_wizard_with_answers(tmp_path, monkeypatch, [
+        "Databricks catalog -> Databricks catalog",
+        "https://adb-1.databricks.net", "/sql/1.0/warehouses/x", "tok",
+        "src_cat", "bronze", "customers",
+        "tgt_cat", "silver", "customers",
+        "",                                    # primary key (blank)
+        False,                                 # customize validation? (declined)
+        ["catalog & schema", "column"],        # validations checkbox: row unchecked
+    ])
+
+    assert set(config.validations) == {
+        ValidationType.CATALOG, ValidationType.SCHEMA, ValidationType.COLUMN,
+    }
+    assert ValidationType.ROW not in config.validations
+
+
+# ---------------------------------------------------------------------------
 # source_type branching: each of the three choices must drive the wizard
 # through its own set of prompts and persist the right config sections.
 # ---------------------------------------------------------------------------
@@ -545,6 +606,117 @@ def test_azure_sql_source_type_prompts_for_sql_scoping(tmp_path, monkeypatch):
     assert config.sql_source.schema_name is None
     assert config.sql_source.table is None
     assert config.blob_source.container is None
+
+
+def test_synapse_source_type_prompts_for_synapse_scoping(tmp_path, monkeypatch):
+    """Selecting the Synapse choice must ask for server/database/
+    credentials + optional schema/table, and never prompt for blob or
+    Azure SQL Database scoping - mirrors the Azure SQL wizard test above,
+    since Synapse's wizard branch has the identical shape."""
+    config = _run_wizard_with_answers(tmp_path, monkeypatch, [
+        "Azure Synapse SQL pool -> Databricks catalog",  # source type select
+        "https://adb-1.databricks.net", "/sql/1.0/warehouses/x", "tok",  # databricks
+        None, None,                                  # tenant_id, subscription_id
+        "myworkspace.sql.azuresynapse.net",          # synapse server
+        "myworkspace",                                # synapse database
+        "SQL login (username + password)",           # auth mode
+        "synuser",                                    # synapse username
+        "synpass",                                    # synapse password
+        "",                                            # synapse_source schema left blank
+        "",                                            # synapse_source table left blank
+        "tgt_cat", "silver", "customers",             # target table
+        [],                                            # validations
+    ])
+
+    assert config.source_type.value == "synapse"
+    assert config.azure.synapse_server == "myworkspace.sql.azuresynapse.net"
+    assert config.azure.synapse_database == "myworkspace"
+    assert config.synapse_source.schema_name is None
+    assert config.synapse_source.table is None
+    assert config.blob_source.container is None
+    assert config.sql_source.schema_name is None
+
+
+def test_synapse_entra_auth_mode_collects_service_principal_not_sql_login(
+    tmp_path, monkeypatch
+):
+    """Choosing Entra service-principal auth must store the auth mode +
+    client ID in config and the secret in .env, and must NOT ask for (or
+    store) a SQL username/password - a workspace with SQL auth disabled
+    has no such login to give."""
+    from table_validator.config.schema import SynapseAuthMode
+
+    config = _run_wizard_with_answers(tmp_path, monkeypatch, [
+        "Azure Synapse SQL pool -> Databricks catalog",
+        "https://adb-1.databricks.net", "/sql/1.0/warehouses/x", "tok",
+        "my-tenant-id", None,                          # tenant_id, subscription_id
+        "myworkspace.sql.azuresynapse.net",
+        "myworkspace",
+        "Microsoft Entra ID service principal (tenant + client ID + secret)",
+        "my-client-id",                                 # client id
+        "my-client-secret",                             # client secret
+        "",                                              # schema blank
+        "",                                              # table blank
+        "tgt_cat", "silver", "customers",
+        [],
+    ])
+
+    assert config.azure.synapse_auth_mode == SynapseAuthMode.ENTRA_SERVICE_PRINCIPAL
+    assert config.azure.tenant_id == "my-tenant-id"
+    assert config.azure.synapse_client_id == "my-client-id"
+
+    env_text = (tmp_path / ".env").read_text(encoding="utf-8")
+    assert "SYNAPSE_CLIENT_SECRET=my-client-secret" in env_text
+    assert "SYNAPSE_USERNAME" not in env_text
+    assert "SYNAPSE_PASSWORD" not in env_text
+
+
+def test_synapse_sql_auth_mode_stores_sql_mode_explicitly(tmp_path, monkeypatch):
+    """The SQL branch must set synapse_auth_mode = SQL explicitly, so
+    re-running configure to switch back FROM Entra actually clears the
+    Entra mode rather than leaving a stale value behind."""
+    from table_validator.config.schema import SynapseAuthMode
+
+    config = _run_wizard_with_answers(tmp_path, monkeypatch, [
+        "Azure Synapse SQL pool -> Databricks catalog",
+        "https://adb-1.databricks.net", "/sql/1.0/warehouses/x", "tok",
+        None, None,
+        "myworkspace.sql.azuresynapse.net",
+        "myworkspace",
+        "SQL login (username + password)",
+        "synuser",
+        "synpass",
+        "", "",
+        "tgt_cat", "silver", "customers",
+        [],
+    ])
+
+    assert config.azure.synapse_auth_mode == SynapseAuthMode.SQL
+    assert config.azure.synapse_client_id is None
+
+
+def test_synapse_prompts_for_primary_key_when_table_named(tmp_path, monkeypatch):
+    """Same regression class as the Azure SQL equivalent above: naming a
+    specific table on both sides for a Synapse source must still reach
+    the primary-key prompt, not silently skip it."""
+    config = _run_wizard_with_answers(tmp_path, monkeypatch, [
+        "Azure Synapse SQL pool -> Databricks catalog",
+        "https://adb-1.databricks.net", "/sql/1.0/warehouses/x", "tok",
+        None, None,
+        "myworkspace.sql.azuresynapse.net",
+        "myworkspace",
+        "SQL login (username + password)",     # auth mode
+        "synuser",
+        "synpass",
+        "dbo",                                 # synapse_source schema
+        "employees",                            # synapse_source table
+        "tgt_cat", "dbo", "employees_sample",  # target table
+        "EmployeeID",                           # primary key
+        False,                                  # customize validation? (declined)
+        [],
+    ])
+
+    assert config.primary_key == ["EmployeeID"]
 
 
 def test_azure_sql_prompts_for_primary_key_when_table_named(tmp_path, monkeypatch):
@@ -805,5 +977,137 @@ def test_column_mapping_skipped_for_azure_sql_source_type(tmp_path, monkeypatch)
         databricks_token="dapi_fake",
         databricks_connector=connector,
     )
+
+
+# ---------------------------------------------------------------------------
+# Schema-wide sweep scoping (only_tables / table_map): schema named on both
+# sides, table left blank on both sides.
+# ---------------------------------------------------------------------------
+def test_schema_scoping_prompt_skipped_when_a_table_is_named(tmp_path, monkeypatch):
+    """The single-table branch (both tables named) must never reach the
+    schema-scoping prompt at all - no extra answer should be consumed."""
+    config = _run_wizard_with_answers(tmp_path, monkeypatch, [
+        "Databricks catalog -> Databricks catalog",
+        "https://adb-1.databricks.net", "/sql/1.0/warehouses/x", "tok",
+        "src_cat", "bronze", "customers",
+        "tgt_cat", "silver", "customers",
+        "",                                    # primary key (blank)
+        False,                                 # customize validation? (declined)
+        # no schema-scoping answer here - none should be consumed
+        [],
+    ])
+
+    assert config.only_tables is None
+    assert config.table_map == {}
+
+
+def test_schema_scoping_prompt_skipped_when_schema_left_blank(tmp_path, monkeypatch):
+    """A catalog-wide sweep (schema also left blank) must never reach the
+    schema-scoping prompt either."""
+    config = _run_wizard_with_answers(tmp_path, monkeypatch, [
+        "Databricks catalog -> Databricks catalog",
+        "https://adb-1.databricks.net", "/sql/1.0/warehouses/x", "tok",
+        "src_cat", "", "",
+        "tgt_cat", "", "",
+        # no schema-scoping answer here - none should be consumed
+        [],
+    ])
+
+    assert config.only_tables is None
+    assert config.table_map == {}
+
+
+def test_schema_scoping_declined_leaves_defaults_untouched(tmp_path, monkeypatch):
+    """Schema named, table blank on both sides -> the wizard must ask the
+    customize-schema gate; declining leaves only_tables/table_map unset."""
+    config = _run_wizard_with_answers(tmp_path, monkeypatch, [
+        "Databricks catalog -> Databricks catalog",
+        "https://adb-1.databricks.net", "/sql/1.0/warehouses/x", "tok",
+        "src_cat", "bronze", "",
+        "tgt_cat", "silver", "",
+        False,                                 # customize this schema? (declined)
+        [],
+    ])
+
+    assert config.only_tables is None
+    assert config.table_map == {}
+
+
+def test_schema_scoping_select_specific_tables(tmp_path, monkeypatch):
+    """Choosing 'select specific tables' must parse a comma-separated
+    answer into only_tables, and leave table_map untouched."""
+    config = _run_wizard_with_answers(tmp_path, monkeypatch, [
+        "Databricks catalog -> Databricks catalog",
+        "https://adb-1.databricks.net", "/sql/1.0/warehouses/x", "tok",
+        "src_cat", "bronze", "",
+        "tgt_cat", "silver", "",
+        True,                                  # customize this schema? (accepted)
+        "Select specific tables to validate",  # choice
+        "customers, orders ",                  # table names
+        [],
+    ])
+
+    assert config.only_tables == ["customers", "orders"]
+    assert config.table_map == {}
+
+
+def test_schema_scoping_map_renamed_tables(tmp_path, monkeypatch):
+    """Choosing 'map renamed tables' must parse 'source=target' pairs
+    into table_map, ignoring malformed entries, and leave only_tables
+    untouched."""
+    config = _run_wizard_with_answers(tmp_path, monkeypatch, [
+        "Databricks catalog -> Databricks catalog",
+        "https://adb-1.databricks.net", "/sql/1.0/warehouses/x", "tok",
+        "src_cat", "bronze", "",
+        "tgt_cat", "silver", "",
+        True,                                              # customize this schema?
+        "Map renamed tables (source name -> target name)",  # choice
+        "cust=customers, ord=orders, malformed",             # pairs
+        [],
+    ])
+
+    assert config.table_map == {"cust": "customers", "ord": "orders"}
+    assert config.only_tables is None
+
+
+def test_schema_scoping_map_renamed_tables_clears_stale_only_tables(tmp_path, monkeypatch):
+    """Regression test for a real bug found via live user testing: a
+    stale only_tables allowlist from an earlier configure run (e.g. from
+    a previous 'select specific tables' choice, or an older single-table
+    config) silently survived when the user re-ran configure and chose
+    'map renamed tables' instead - the leftover allowlist then filtered
+    the freshly-mapped table straight back out of validation, making the
+    new table_map entry appear to do nothing. Picking 'map renamed
+    tables' must always clear any pre-existing only_tables value."""
+    import table_validator.config.manager as manager_mod
+
+    config_path = tmp_path / "config.yaml"
+    from table_validator.config.schema import ValidatorConfig
+    from table_validator.config.manager import save_config
+
+    stale = ValidatorConfig()
+    stale.source_table.catalog = "for_validation1"
+    stale.source_table.schema_name = "for_schema_validation"
+    stale.target_table.catalog = "for_validation2"
+    stale.target_table.schema_name = "for_schema_validation"
+    stale.only_tables = ["file_example_xlsx_100"]
+    save_config(stale, config_path)
+
+    monkeypatch.setattr(manager_mod, "CONFIG_PATH", config_path)
+
+    config = _run_wizard_with_answers(tmp_path, monkeypatch, [
+        True,                                  # overwrite existing config?
+        "Databricks catalog -> Databricks catalog",
+        "https://adb-1.databricks.net", "/sql/1.0/warehouses/x", "tok",
+        "src_cat", "bronze", "",
+        "tgt_cat", "silver", "",
+        True,                                              # customize this schema?
+        "Map renamed tables (source name -> target name)",  # choice
+        "sample_quoted_1=sample_data",                       # pairs
+        [],
+    ])
+
+    assert config.table_map == {"sample_quoted_1": "sample_data"}
+    assert config.only_tables is None
 
     assert config.column_map == {}

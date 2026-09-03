@@ -274,6 +274,48 @@ def test_get_row_detail_for_keys_builds_in_clause_and_returns_diff(monkeypatch):
     assert any("IN ('2')" in q for q in queries)
 
 
+def test_get_row_detail_for_keys_queries_independent_source_and_target_table_names(monkeypatch):
+    """Regression test for a real bug found via live user testing: a
+    genuinely renamed table pair (table_map, or source_table.table !=
+    target_table.table with a real primary key configured) previously
+    always queried BOTH catalogs under the single `table` name - which
+    doesn't exist in the source catalog under the target's name, and
+    raised TABLE_OR_VIEW_NOT_FOUND. source_schema/source_table/
+    target_schema/target_table must each qualify their own side."""
+    connector = _connector()
+    queries = []
+
+    def fake_execute(query):
+        queries.append(query)
+        first_from = query.strip().splitlines()[1].strip()
+        if first_from.startswith("FROM `cat_source`.`sch`.`old_name`"):
+            return pd.DataFrame([{"id": 2, "name": "old", "__row_hash": 111}])
+        if first_from.startswith("FROM `cat_target`.`sch`.`new_name`"):
+            return pd.DataFrame([{"id": 2, "name": "new", "__row_hash": 222}])
+        raise AssertionError(f"Unexpected query target: {first_from}")
+
+    monkeypatch.setattr(connector, "_execute_to_dataframe", fake_execute)
+
+    detail = connector.get_row_detail_for_keys(
+        source_catalog="cat_source",
+        target_catalog="cat_target",
+        schema="sch",
+        table="new_name",  # legacy shared param - must NOT be used for source
+        key_column="id",
+        key_values=["2"],
+        value_columns=["name"],
+        source_schema="sch",
+        source_table="old_name",
+        target_schema="sch",
+        target_table="new_name",
+    )
+
+    assert len(detail) == 1
+    assert detail[0]["mismatched_columns"] == ["name"]
+    assert detail[0]["source_values"]["name"] == "old"
+    assert detail[0]["target_values"]["name"] == "new"
+
+
 def test_get_row_detail_for_keys_empty_keys_short_circuits(monkeypatch):
     connector = _connector()
     monkeypatch.setattr(
@@ -342,6 +384,53 @@ def test_get_row_detail_for_row_numbers_builds_windowed_query_and_returns_diff(m
         # Never the physical-column IN-clause shape used by the real-key
         # Tier 5 path - ROW_NUMBER() isn't a base-table column.
         assert "CAST(`row_number` AS STRING) IN" not in query
+
+
+def test_get_row_detail_for_row_numbers_queries_independent_source_and_target_table_names(monkeypatch):
+    """Regression test for the exact bug hit in live user testing: no
+    primary key configured (ROW_NUMBER() fallback) plus a genuinely
+    renamed source/target table pair (e.g. 'file_example_xlsx_100' vs
+    'file_example_xlsx_100_1', matched via the single-table CLI branch,
+    not table_map) - previously always queried BOTH catalogs under the
+    single `table` name, so the source catalog was queried for the
+    TARGET's table name and raised TABLE_OR_VIEW_NOT_FOUND, leaving
+    sample_changed_detail (Data Mismatches / Mismatch Categories) empty
+    even though Tier 4 had already confirmed real row-hash mismatches."""
+    connector = _connector()
+    queries = []
+
+    def fake_execute(query):
+        queries.append(query)
+        from_line = next(
+            line.strip() for line in query.strip().splitlines()
+            if line.strip().startswith("FROM `")
+        )
+        if from_line.startswith("FROM `cat_source`.`sch`.`old_name`"):
+            return pd.DataFrame([{"row_number": 2, "id": 2, "name": "old", "__row_hash": 111}])
+        if from_line.startswith("FROM `cat_target`.`sch`.`new_name`"):
+            return pd.DataFrame([{"row_number": 2, "id": 2, "name": "new", "__row_hash": 222}])
+        raise AssertionError(f"Unexpected query target: {from_line}")
+
+    monkeypatch.setattr(connector, "_execute_to_dataframe", fake_execute)
+
+    detail = connector.get_row_detail_for_row_numbers(
+        source_catalog="cat_source",
+        target_catalog="cat_target",
+        schema="sch",
+        table="new_name",  # legacy shared param - must NOT be used for source
+        order_by_columns=["id", "name"],
+        row_numbers=[2],
+        value_columns=["id", "name"],
+        source_schema="sch",
+        source_table="old_name",
+        target_schema="sch",
+        target_table="new_name",
+    )
+
+    assert len(detail) == 1
+    assert detail[0]["mismatched_columns"] == ["name"]
+    assert detail[0]["source_values"]["name"] == "old"
+    assert detail[0]["target_values"]["name"] == "new"
 
 
 def test_get_row_detail_for_row_numbers_empty_row_numbers_short_circuits(monkeypatch):

@@ -272,3 +272,91 @@ def test_compare_tables_table_map_preserves_unmapped_identical_matches():
     assert sorted(common_pairs) == [("Employees", "employees_sample"), ("orders", "orders")]
     assert missing == []
     assert extra == []
+
+
+# ---------------------------------------------------------------------------
+# AzureSqlConnector auth modes: SQL login vs Microsoft Entra ID service
+# principal. Entra is required by Synapse workspaces that have SQL
+# authentication disabled, where any UID/PWD is rejected outright.
+# ---------------------------------------------------------------------------
+def test_connector_defaults_to_sql_auth_when_username_password_given():
+    from table_validator.connectors.azure_connector import AzureSqlConnector
+
+    connector = AzureSqlConnector(
+        server="s.database.windows.net", database="db",
+        username="u", password="p",
+    )
+
+    assert connector._use_entra is False
+
+
+def test_connector_uses_entra_when_full_service_principal_given():
+    from table_validator.connectors.azure_connector import AzureSqlConnector
+
+    connector = AzureSqlConnector(
+        server="ws.sql.azuresynapse.net", database="pool",
+        tenant_id="t", client_id="c", client_secret="s",
+    )
+
+    assert connector._use_entra is True
+
+
+def test_connector_entra_takes_precedence_over_a_leftover_sql_login():
+    """A config carrying both must resolve deterministically to Entra,
+    not depend on argument order or silently prefer the stale login."""
+    from table_validator.connectors.azure_connector import AzureSqlConnector
+
+    connector = AzureSqlConnector(
+        server="ws.sql.azuresynapse.net", database="pool",
+        username="u", password="p",
+        tenant_id="t", client_id="c", client_secret="s",
+    )
+
+    assert connector._use_entra is True
+
+
+def test_connector_partial_service_principal_falls_back_to_sql_requirement():
+    """Two of the three Entra fields is not a usable service principal -
+    without a SQL login too, that must be a clear ValueError rather than
+    an attempted half-configured Entra connection."""
+    import pytest
+
+    from table_validator.connectors.azure_connector import AzureSqlConnector
+
+    with pytest.raises(ValueError, match="Entra service principal"):
+        AzureSqlConnector(
+            server="ws.sql.azuresynapse.net", database="pool",
+            tenant_id="t", client_id="c",  # no client_secret
+        )
+
+
+def test_entra_access_token_struct_uses_length_prefixed_utf16le(monkeypatch):
+    """The ODBC access-token attribute expects a 4-byte little-endian
+    length prefix followed by the UTF-16-LE token bytes - getting this
+    layout wrong is silently rejected by the driver, so pin it."""
+    import struct
+    import sys
+    import types
+
+    from table_validator.connectors.azure_connector import AzureSqlConnector
+
+    fake_credential = MagicMock()
+    fake_credential.get_token.return_value = MagicMock(token="abc")
+
+    fake_identity = types.ModuleType("azure.identity")
+    fake_identity.ClientSecretCredential = MagicMock(return_value=fake_credential)
+    monkeypatch.setitem(sys.modules, "azure.identity", fake_identity)
+
+    connector = AzureSqlConnector(
+        server="ws.sql.azuresynapse.net", database="pool",
+        tenant_id="t", client_id="c", client_secret="s",
+    )
+    packed = connector._entra_access_token_struct()
+
+    expected_bytes = "abc".encode("utf-16-le")
+    assert packed == struct.pack("<i", len(expected_bytes)) + expected_bytes
+
+    # Azure SQL's resource scope - the correct audience for Synapse SQL too.
+    fake_credential.get_token.assert_called_once_with(
+        "https://database.windows.net/.default"
+    )

@@ -21,6 +21,7 @@ from __future__ import annotations
 import fnmatch
 import logging
 import re
+import struct
 from io import BytesIO, StringIO
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -292,19 +293,47 @@ class AzureSqlConnector:
         database: Optional[str] = None,
         username: Optional[str] = None,
         password: Optional[str] = None,
+        tenant_id: Optional[str] = None,
+        client_id: Optional[str] = None,
+        client_secret: Optional[str] = None,
     ) -> None:
         """
-        All four arguments must be resolved by the caller before
-        construction - server/database from config.azure.sql_server/
-        sql_database, username/password via
-        table_validator.auth.azure_auth.get_azure_credential(). This
-        connector does not read credentials from the environment itself.
+        server/database are always required, and come from
+        config.azure.sql_server/sql_database (or synapse_server/
+        synapse_database for a Synapse source).
+
+        Two mutually-exclusive auth modes, selected by which credential
+        set the caller supplies - this connector never reads credentials
+        from the environment itself:
+
+        - SQL auth (the original, still the default): username +
+          password, resolved via
+          table_validator.auth.azure_auth.get_azure_credential(). Sent as
+          UID=/PWD= in the ODBC connection string.
+        - Microsoft Entra ID service principal: tenant_id + client_id +
+          client_secret. An Entra access token for the Azure SQL resource
+          scope is fetched via azure-identity's ClientSecretCredential and
+          handed to the ODBC driver through the SQL_COPT_SS_ACCESS_TOKEN
+          connection attribute - NOT via the connection string, since a
+          token can't be expressed there. UID/PWD are omitted entirely in
+          this mode (supplying both is what makes the driver reject the
+          connection with "Invalid connection string attribute").
+
+        Entra credentials take precedence when all three are present, so
+        a config carrying both a leftover SQL login and a service
+        principal deterministically uses the service principal rather
+        than silently depending on argument order.
         """
 
         self._server = server
         self._database = database
         self._username = username
         self._password = password
+        self._tenant_id = tenant_id
+        self._client_id = client_id
+        self._client_secret = client_secret
+
+        self._use_entra = bool(tenant_id and client_id and client_secret)
 
         if not self._server or not self._database:
             raise ValueError(
@@ -312,42 +341,89 @@ class AzureSqlConnector:
                 "Provide them via constructor arguments."
             )
 
-        if not self._username or not self._password:
+        if not self._use_entra and not (self._username and self._password):
             raise ValueError(
-                "Azure SQL username and password are required. "
-                "Provide them via constructor arguments."
+                "Either a SQL username/password, or a full Entra service "
+                "principal (tenant_id + client_id + client_secret), is "
+                "required. Provide them via constructor arguments."
             )
 
         self._connection: Optional[pyodbc.Connection] = None
 
         logger.debug(
-            "AzureSqlConnector initialized for server=%s database=%s",
+            "AzureSqlConnector initialized for server=%s database=%s auth=%s",
             self._server, self._database,
+            "entra_service_principal" if self._use_entra else "sql",
         )
 
     # ------------------------------------------------------------------
     # Connection Lifecycle
     # ------------------------------------------------------------------
+    def _entra_access_token_struct(self) -> bytes:
+        """
+        Fetch an Entra ID access token for the Azure SQL resource and pack
+        it into the byte layout the ODBC driver's SQL_COPT_SS_ACCESS_TOKEN
+        attribute expects: a 4-byte little-endian length prefix followed
+        by the UTF-16-LE-encoded token.
+
+        The scope is Azure SQL's own resource ID
+        (https://database.windows.net/.default), which is the correct
+        audience for Synapse SQL pools too - Synapse SQL endpoints
+        authenticate against the same resource as Azure SQL Database.
+        """
+        try:
+            from azure.identity import ClientSecretCredential
+        except ImportError as exc:
+            raise ConnectionError(
+                "Microsoft Entra ID authentication requires the "
+                "'azure-identity' package, which is not installed. "
+                "Install it with: pip install azure-identity"
+            ) from exc
+
+        credential = ClientSecretCredential(
+            tenant_id=self._tenant_id,
+            client_id=self._client_id,
+            client_secret=self._client_secret,
+        )
+        token = credential.get_token("https://database.windows.net/.default").token
+
+        token_bytes = token.encode("utf-16-le")
+        return struct.pack("<i", len(token_bytes)) + token_bytes
+
     def connect(self) -> None:
 
         if self._connection is not None:
             return
 
-        conn_str = (
+        base_conn_str = (
             "DRIVER={ODBC Driver 17 for SQL Server};"
             f"SERVER=tcp:{self._server},1433;"
             f"DATABASE={self._database};"
-            f"UID={self._username};"
-            f"PWD={self._password};"
             "Encrypt=yes;TrustServerCertificate=no;Connection Timeout=30;"
         )
 
         try:
-            self._connection = pyodbc.connect(conn_str)
+            if self._use_entra:
+                # SQL_COPT_SS_ACCESS_TOKEN. Not exposed as a pyodbc
+                # constant, so the raw driver value is used directly.
+                sql_copt_ss_access_token = 1256
+                token_struct = self._entra_access_token_struct()
+                self._connection = pyodbc.connect(
+                    base_conn_str,
+                    attrs_before={sql_copt_ss_access_token: token_struct},
+                )
+                auth_desc = "Entra service principal"
+            else:
+                conn_str = (
+                    base_conn_str
+                    + f"UID={self._username};PWD={self._password};"
+                )
+                self._connection = pyodbc.connect(conn_str)
+                auth_desc = "SQL authentication"
 
             logger.info(
-                "Successfully connected to Azure SQL Database '%s' on '%s'",
-                self._database, self._server,
+                "Successfully connected to Azure SQL Database '%s' on '%s' (%s)",
+                self._database, self._server, auth_desc,
             )
 
         except pyodbc.Error as exc:
@@ -359,6 +435,12 @@ class AzureSqlConnector:
             raise ConnectionError(
                 f"Unable to connect to Azure SQL Database: {sanitized_exc}"
             ) from None
+        except ConnectionError:
+            # Already a clear, actionable message (e.g. azure-identity
+            # missing, or token acquisition failed) - don't re-wrap it
+            # into a generic "unable to connect".
+            self._connection = None
+            raise
         except Exception as exc:
             self._connection = None
             logger.exception("Failed to connect to Azure SQL Database")

@@ -11,6 +11,7 @@ Currently supported sources (target is always Databricks):
 - Databricks catalog &rarr; Databricks catalog
 - Azure Blob Storage (CSV / Excel / Parquet) &rarr; Databricks table
 - Azure SQL Database &rarr; Databricks catalog
+- Azure Synapse SQL pool (dedicated or serverless) &rarr; Databricks catalog
 
 More source platforms can be added behind the same connector/validator
 interfaces described below.
@@ -53,10 +54,11 @@ Interactive wizard that walks you through:
 
 1. Azure Storage account + container (optional, skip if you don't have a Blob source) and account key
 2. Azure SQL server + database (optional, skip if you don't have a SQL source) and username/password
-3. Databricks workspace URL, SQL Warehouse HTTP path, and personal access token
-4. Source table (catalog / schema / table)
-5. Target table (catalog / schema / table)
-6. Which validations to run (catalog / schema / column / row)
+3. Azure Synapse SQL pool endpoint + database (optional, skip if you don't have a Synapse source), then either a SQL login (username/password) or a Microsoft Entra ID service principal (tenant ID + client ID + client secret)
+4. Databricks workspace URL, SQL Warehouse HTTP path, and personal access token
+5. Source table (catalog / schema / table)
+6. Target table (catalog / schema / table)
+7. Which validations to run (catalog / schema / column / row)
 
 ```bash
 tablevalidator validate

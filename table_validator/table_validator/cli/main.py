@@ -19,7 +19,12 @@ from table_validator.cli.summary_table import (
 from table_validator.cli.partition_prompt import build_partition_prompt
 from table_validator.cli.wizard import run_configure_wizard
 from table_validator.config.manager import CONFIG_PATH, ConfigNotFoundError, require_config
-from table_validator.config.schema import SourceType, ValidationType, ValidatorConfig
+from table_validator.config.schema import (
+    SourceType,
+    SynapseAuthMode,
+    ValidationType,
+    ValidatorConfig,
+)
 from table_validator.connectors.azure_connector import AzureConnector, AzureSqlConnector
 from table_validator.connectors.databricks_connector import DatabricksConnector
 from table_validator.models import (
@@ -207,6 +212,18 @@ def validate(
             "prompt on its own, but --yes makes that explicit."
         ),
     ),
+    skip_category_summary: bool = typer.Option(
+        False,
+        "--skip-category-summary",
+        help=(
+            "Omit the 'Mismatch Categories' sheet (root-cause "
+            "classification + plain-English summary of Data Mismatches) "
+            "from the Excel report. Every other sheet, including Data "
+            "Mismatches itself, is unaffected - this recovers the exact "
+            "report shape from before the mismatch-categorization "
+            "feature existed, for anyone who doesn't want it."
+        ),
+    ),
 ) -> None:
     """Run validation and produce an Excel validation report."""
 
@@ -281,6 +298,8 @@ def validate(
             result = _run_blob_validation(config, azure_credential, databricks)
         elif config.source_type == SourceType.AZURE_SQL:
             result = _run_sql_validation(config, azure_credential, databricks)
+        elif config.source_type == SourceType.SYNAPSE:
+            result = _run_synapse_validation(config, azure_credential, databricks)
         else:
             result = _run_databricks_validation(config, databricks, mode=mode, yes=yes)
     except ValueError as exc:
@@ -310,6 +329,7 @@ def validate(
             result, str(output),
             source_type=config.source_type.value,
             enabled_validations=report_enabled_validations,
+            skip_category_summary=skip_category_summary,
         )
     except PermissionError:
         typer.secho(
@@ -444,6 +464,17 @@ def _run_databricks_validation(
         tables_restriction = [config.source_table.table]
         if config.source_table.table.lower() != config.target_table.table.lower():
             table_map = {config.source_table.table: config.target_table.table}
+    else:
+        # Schema-wide sweep (no single table named on both sides) - apply
+        # the wizard's optional only_tables allowlist / table_map renaming
+        # for this schema, if the user set either. Both are no-ops
+        # (tables_restriction stays None, table_map stays {}) unless the
+        # user actually configured them, so a plain schema sweep behaves
+        # exactly as before this feature existed.
+        if config.only_tables:
+            tables_restriction = list(config.only_tables)
+        if config.table_map:
+            table_map = dict(config.table_map)
 
     # A configured primary key only applies to the single named table
     # (not a catalog-wide sweep) - CatalogValidator looks it up by
@@ -603,6 +634,113 @@ def _run_sql_validation(
     return validator.validate(request)
 
 
+def _run_synapse_validation(
+    config: ValidatorConfig,
+    azure_credential,
+    databricks: DatabricksConnector,
+) -> CatalogValidationResponse:
+    """source_type == synapse: Azure Synapse SQL pool (dedicated or
+    serverless) against a Databricks catalog. Synapse SQL is
+    protocol-identical T-SQL over the same ODBC driver Azure SQL Database
+    uses, so this reuses AzureSqlConnector/AzureSqlValidator UNCHANGED,
+    just constructed with the Synapse server/database/credentials instead
+    of an Azure SQL DB's - no new connector or validator class, mirrors
+    _run_sql_validation's logic exactly (see that function for the
+    schema_map/table_map/primary_keys/FULL-mode rationale, identical
+    here).
+
+    Auth is the one place Synapse genuinely diverges from the Azure SQL
+    path: config.azure.synapse_auth_mode selects between a SQL login
+    (SYNAPSE_USERNAME/SYNAPSE_PASSWORD) and a Microsoft Entra ID service
+    principal (azure.tenant_id + azure.synapse_client_id +
+    SYNAPSE_CLIENT_SECRET). Entra is what a workspace with SQL
+    authentication disabled requires - the connector fetches an access
+    token and passes it via the ODBC access-token attribute rather than
+    sending UID/PWD at all.
+
+    Not yet verified against a live Synapse SQL pool for pool-specific
+    T-SQL quirks (dedicated pools have historically had some system-view/
+    HASHBYTES-adjacent gaps vs. Azure SQL DB) - flagged here rather than
+    assumed away; report back if a specific query fails against your pool
+    and it can be special-cased in AzureSqlConnector the same way
+    decimal_as_integer/float formatting already are for Databricks
+    compatibility.
+    """
+    if not config.azure.synapse_server or not config.azure.synapse_database:
+        raise ValueError(
+            "azure.synapse_server and azure.synapse_database are required "
+            "for a Synapse source. Run 'tablevalidator configure' first."
+        )
+
+    if config.azure.synapse_auth_mode == SynapseAuthMode.ENTRA_SERVICE_PRINCIPAL:
+        missing_entra = []
+        if not config.azure.tenant_id:
+            missing_entra.append("azure.tenant_id (in config.yaml)")
+        if not config.azure.synapse_client_id:
+            missing_entra.append("azure.synapse_client_id (in config.yaml)")
+        if not azure_credential.synapse_client_secret:
+            missing_entra.append("SYNAPSE_CLIENT_SECRET (in ~/.table_validator/.env)")
+        if missing_entra:
+            raise ValueError(
+                "Synapse is configured for Entra service-principal auth but "
+                "these are missing: " + ", ".join(missing_entra)
+                + ". Run 'tablevalidator configure' first."
+            )
+
+        synapse = AzureSqlConnector(
+            server=config.azure.synapse_server,
+            database=config.azure.synapse_database,
+            tenant_id=config.azure.tenant_id,
+            client_id=config.azure.synapse_client_id,
+            client_secret=azure_credential.synapse_client_secret,
+        )
+    else:
+        if not azure_credential.synapse_username or not azure_credential.synapse_password:
+            raise ValueError(
+                "No Synapse username/password found in ~/.table_validator/.env. "
+                "Run 'tablevalidator configure' first."
+            )
+
+        synapse = AzureSqlConnector(
+            server=config.azure.synapse_server,
+            database=config.azure.synapse_database,
+            username=azure_credential.synapse_username,
+            password=azure_credential.synapse_password,
+        )
+
+    schema_map: Dict[str, str] = {}
+    schemas_restriction = None
+    if config.synapse_source.schema_name and config.target_table.schema_name:
+        schema_map = {config.synapse_source.schema_name: config.target_table.schema_name}
+        schemas_restriction = [config.synapse_source.schema_name]
+
+    table_map: Dict[str, str] = {}
+    tables_restriction = None
+    if config.synapse_source.table and config.target_table.table:
+        table_map = {config.synapse_source.table: config.target_table.table}
+        tables_restriction = [config.synapse_source.table]
+
+    primary_keys: Dict[str, list] = {}
+    if config.primary_key and config.target_table.table:
+        primary_keys[config.target_table.table] = config.primary_key
+        if config.target_table.schema_name:
+            key = f"{config.target_table.schema_name}.{config.target_table.table}"
+            primary_keys[key] = config.primary_key
+
+    request = AzureSqlValidationRequest(
+        target_catalog=config.target_table.catalog or "",
+        schemas=schemas_restriction,
+        schema_map=schema_map,
+        tables=tables_restriction,
+        table_map=table_map,
+        primary_keys=primary_keys,
+        data_compare_mode=DataCompareMode.FULL,
+    )
+
+    validator = AzureSqlValidator(synapse, databricks)
+    return validator.validate(request)
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -632,6 +770,11 @@ def _missing_config_fields(config: ValidatorConfig) -> list:
             missing.append("azure.sql_server")
         if not config.azure.sql_database:
             missing.append("azure.sql_database")
+    elif config.source_type == SourceType.SYNAPSE:
+        if not config.azure.synapse_server:
+            missing.append("azure.synapse_server")
+        if not config.azure.synapse_database:
+            missing.append("azure.synapse_database")
     else:
         if not config.source_table.catalog:
             missing.append("source_table.catalog")
@@ -696,6 +839,17 @@ def _describe_scope(config: ValidatorConfig) -> str:
             source_desc = f"sql:{database}.{config.sql_source.schema_name} (all tables)"
         else:
             source_desc = f"sql:{database}.{config.sql_source.schema_name}.{config.sql_source.table}"
+    elif config.source_type == SourceType.SYNAPSE:
+        database = config.azure.synapse_database or "?"
+        if not config.synapse_source.schema_name:
+            source_desc = f"synapse:{database} (all schemas)"
+        elif not config.synapse_source.table:
+            source_desc = f"synapse:{database}.{config.synapse_source.schema_name} (all tables)"
+        else:
+            source_desc = (
+                f"synapse:{database}.{config.synapse_source.schema_name}."
+                f"{config.synapse_source.table}"
+            )
     else:
         source_desc = _side(config.source_table)
 

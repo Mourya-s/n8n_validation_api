@@ -879,6 +879,10 @@ class DatabricksConnector:
         value_columns: Sequence[str],
         limit_samples: int = 500,
         target_value_columns: Optional[Sequence[str]] = None,
+        source_schema: Optional[str] = None,
+        source_table: Optional[str] = None,
+        target_schema: Optional[str] = None,
+        target_table: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """
         Tier 5: column-level diff for a bounded, already-known set of
@@ -895,12 +899,21 @@ class DatabricksConnector:
         identical on both sides (a column used as a primary key must not
         also be renamed via column_map - enforced at request-resolution
         time, not here).
+
+        `schema`/`table` are the legacy shared-name params, used for both
+        sides when the newer, independent `source_schema`/`source_table`/
+        `target_schema`/`target_table` are left unset - this is what kept
+        this call working correctly for a schema_map/table_map pair (a
+        genuinely differently-named source/target table), which previously
+        always queried the source catalog for the TARGET-side name and
+        failed with TABLE_OR_VIEW_NOT_FOUND whenever the two names
+        actually differed.
         """
         if not key_values:
             return []
 
-        src = self._qualify(source_catalog, schema, table)
-        tgt = self._qualify(target_catalog, schema, table)
+        src = self._qualify(source_catalog, source_schema or schema, source_table or table)
+        tgt = self._qualify(target_catalog, target_schema or schema, target_table or table)
         key_ident = self._quote_ident(key_column)
         quoted_values = ", ".join(f"'{str(v).replace(chr(39), chr(39) * 2)}'" for v in key_values)
         changed_query = (
@@ -1168,6 +1181,10 @@ class DatabricksConnector:
         bucket_predicate: Optional[Tuple[str, Any]] = None,
         target_order_by_columns: Optional[Sequence[str]] = None,
         target_value_columns: Optional[Sequence[str]] = None,
+        source_schema: Optional[str] = None,
+        source_table: Optional[str] = None,
+        target_schema: Optional[str] = None,
+        target_table: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """
         Best-effort Tier 5 column-level diff for the ROW_NUMBER() fallback
@@ -1185,6 +1202,20 @@ class DatabricksConnector:
         row numbers consistent between the hash-computation pass (Tier 4)
         and this re-fetch (Tier 5). When omitted, the target lists default
         to the source lists (today's behavior, unchanged).
+
+        `schema`/`table` are the legacy shared-name params, used for both
+        sides when the newer, independent `source_schema`/`source_table`/
+        `target_schema`/`target_table` are left unset. Real bug fixed
+        here: previously this method ALWAYS queried both source_catalog
+        and target_catalog using the single `table` name - fine when
+        source/target share a name, but for a genuinely renamed table
+        pair (schema_map/table_map, or the CLI's own source_table.table
+        != target_table.table with no primary key configured) it silently
+        queried the SOURCE catalog for the TARGET's table name, which
+        doesn't exist there, and raised TABLE_OR_VIEW_NOT_FOUND - Tier 5
+        would then fail and sample_changed_detail (the Data Mismatches /
+        Mismatch Categories sheets' data source) stayed empty even though
+        Tier 4 had already confirmed real row-hash mismatches.
 
         This is inherently best-effort, not a substitute for a real key:
         "row N" on the source and target are only the same logical record
@@ -1211,8 +1242,8 @@ class DatabricksConnector:
         target_value_columns = list(target_value_columns or value_columns)
         source_to_target = dict(zip(value_columns, target_value_columns))
 
-        src = self._qualify(source_catalog, schema, table)
-        tgt = self._qualify(target_catalog, schema, table)
+        src = self._qualify(source_catalog, source_schema or schema, source_table or table)
+        tgt = self._qualify(target_catalog, target_schema or schema, target_table or table)
         source_order_by = ", ".join(self._quote_ident(c) for c in order_by_columns)
         target_order_by = ", ".join(self._quote_ident(c) for c in target_order_by_columns)
         source_value_idents = [self._quote_ident(c) for c in value_columns]
