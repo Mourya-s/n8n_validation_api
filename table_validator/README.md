@@ -105,6 +105,10 @@ Overall status: FAIL
 Tables: 1 total, 0 passed, 1 failed, 0 error, 0 skipped
 ```
 
+Call `validate_tables.help()` any time (no arguments, no live Spark
+connection needed) to print a full syntax reference for every keyword
+argument shown below, directly in the notebook cell.
+
 `result` also exposes each of the Excel report's own sheets as a
 plain-text table - print only the one you want:
 

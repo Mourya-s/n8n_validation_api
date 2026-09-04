@@ -431,3 +431,116 @@ def validate_tables(
     response = CatalogValidator(connector).compare_catalogs(request)
 
     return ValidationResult(response)
+
+
+# ---------------------------------------------------------------------------
+# validate_tables.help() - a code/notebook-usage reference, callable
+# directly on the function (`from table_validator import validate_tables;
+# validate_tables.help()`), separate from `tablevalidator info` (the CLI's
+# own usage reference, cli/main.py's info() command) - each covers only the
+# approach it belongs to, since a CLI-only user has no use for keyword-
+# argument syntax and a notebook-only user never touches config.yaml.
+# ---------------------------------------------------------------------------
+_HELP_TEXT = """
+validate_tables() - notebook-native table validation
+------------------------------------------------------
+Compares a source table against a target Databricks table (or every
+identically-named table across two schemas), from inside a Databricks
+notebook cell - no workspace URL, personal access token, or SQL Warehouse
+HTTP path to set up, since it reuses the notebook's own already-
+authenticated Spark session. Runs the exact same full-depth comparison
+engine as the `tablevalidator` CLI.
+
+Install and import:
+    %pip install table-validator
+    from table_validator import validate_tables
+
+Single-table comparison ("catalog.schema.table" on both sides):
+    result = validate_tables(
+        "catalog1.schema1.table1",
+        "catalog1.schema1.table2",
+    )
+
+Schema-wide sweep (no table named - "catalog.schema" on both sides):
+compares every identically-named table in that schema in one call:
+    result = validate_tables("catalog1.bronze", "catalog2.silver")
+
+    If some tables were renamed between source and target, pass table_map
+    (source name -> target name) - unmapped tables are still matched by
+    identical name as usual:
+        result = validate_tables(
+            "catalog1.bronze", "catalog2.silver",
+            table_map={"cust": "customers", "ord": "orders"},
+        )
+
+Keyword arguments (all optional):
+    primary_key            Real key column(s) for row-level comparison
+                            instead of the synthetic ROW_NUMBER() fallback.
+                            Single-table mode only.
+                                primary_key=["id"]
+    table_map               Renamed-table pairs, schema-wide sweep mode only.
+                                table_map={"cust": "customers"}
+    spark                    An explicit SparkSession, if you're not
+                             running inside an actual Databricks notebook
+                             (e.g. local development). Auto-detected
+                             otherwise.
+    ignore_columns           Columns excluded entirely from every check.
+                                ignore_columns=["updated_at"]
+    only_columns             If set, ONLY these columns (plus the primary
+                             key, if any) are compared.
+                                only_columns=["id", "name"]
+    column_map               Renamed-column pairs (source name -> target
+                             name), for a column that doesn't share a name
+                             between source and target.
+                                column_map={"cust_id": "customer_id"}
+    ignore_datatype_columns  Columns whose data-type mismatch is ignored -
+                             their other checks (nullable, statistics,
+                             row-hash) still run normally.
+                                ignore_datatype_columns=["legacy_flag"]
+    row_filter               Restrict comparison to rows matching a SQL
+                             WHERE-fragment, on BOTH sides - row count,
+                             statistics, fingerprint, and row-hash/column
+                             diff are all scoped to just the matching rows.
+                                row_filter="id > 20 and id < 100"
+                                row_filter="gender = 'male'"
+    source_row_filter        Like row_filter, but applied only to the
+    target_row_filter        source/target side respectively - combine
+                             with row_filter (ANDed) or use instead of it
+                             when the condition must differ per side.
+                                validate_tables(
+                                    "cat.sch.orders", "cat2.sch.orders",
+                                    source_row_filter="id > 20",
+                                    target_row_filter="id > 15",
+                                )
+                             Works in both single-table and schema-wide
+                             sweep mode. Each fragment is used as-is, not
+                             parsed or validated - a typo surfaces as a
+                             normal SQL error when the query runs.
+
+Reading the result:
+    print(result)                     Compact plain-text summary.
+    print(result.table_validation)    One row per table (Excel report's
+                                       "Table Validation" sheet).
+    print(result.column_validation)   One row per column.
+    print(result.data_mismatches)     One row per mismatched cell (needs a
+                                       real primary key or the row-number
+                                       fallback, FULL-depth detail only).
+    print(result.row_hash_mismatches) One row per mismatched primary key.
+    print(result.mismatch_categories) Root-cause breakdown (NULL_MISMATCH,
+                                       STRING_TRUNCATION, ...).
+    print(result.suggestions)         Plain-English fix suggestions.
+
+    Each of these is a small table object - .headers/.rows for
+    programmatic access, or .to_dataframe() for a real pandas DataFrame.
+    result.response is the raw CatalogValidationResponse for full
+    programmatic access beyond the sheet breakdown.
+
+Call validate_tables.help() any time to print this again.
+""".strip("\n")
+
+
+def _print_validate_tables_help() -> None:
+    print(_HELP_TEXT)
+
+
+validate_tables.help = _print_validate_tables_help

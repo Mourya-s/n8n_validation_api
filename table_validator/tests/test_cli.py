@@ -50,10 +50,14 @@ def test_info_command_describes_tool_and_workflow_order() -> None:
     result = runner.invoke(app, ["info"])
 
     assert result.exit_code == 0
-    # All three source types are named.
+    # All four source types are named.
     assert "Databricks catalog" in result.output
     assert "Azure Blob Storage" in result.output
     assert "Azure SQL Database" in result.output
+    assert "Synapse" in result.output
+    # Wizard customization steps are documented, including the row-filter
+    # feature.
+    assert "Filter to a subset of rows" in result.output
     # The three main commands appear in workflow order.
     configure_pos = result.output.index("tablevalidator configure")
     validate_pos = result.output.index("tablevalidator validate")

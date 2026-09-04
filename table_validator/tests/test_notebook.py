@@ -749,3 +749,23 @@ def test_row_filter_valid_in_schema_sweep_mode():
     fake_connector.set_row_filters.assert_called_once_with(
         common="gender = 'male'", source=None, target=None,
     )
+
+
+# ---------------------------------------------------------------------------
+# validate_tables.help() - a code/notebook-usage reference, separate from
+# the CLI's own `tablevalidator info` command.
+# ---------------------------------------------------------------------------
+def test_validate_tables_help_is_callable_and_prints_usage(capsys):
+    """validate_tables.help() must be reachable directly off the imported
+    function, print without requiring a SparkSession/Databricks connection,
+    and cover the keyword arguments a notebook user needs (row filters in
+    particular, the most recently added feature)."""
+    assert callable(validate_tables.help)
+
+    validate_tables.help()
+
+    captured = capsys.readouterr()
+    assert "validate_tables" in captured.out
+    assert "row_filter" in captured.out
+    assert "primary_key" in captured.out
+    assert "table_validation" in captured.out
